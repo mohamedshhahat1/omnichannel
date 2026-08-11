@@ -13,16 +13,15 @@
 | Architecture & documentation | ✅ Complete (Phase 0) |
 | Application foundation (`backend/`) | ✅ Complete (Phase 1) |
 | Configuration, logging, correlation, errors, health, tracing bootstrap | ✅ Complete (Phase 1) |
+| Infrastructure foundation (PostgreSQL, Redis, Celery, Alembic, Docker) | ✅ Complete (Phase 2) |
 | Business modules | ⛔ None — `app/modules/` is intentionally empty |
-| Database models | ⛔ None (Phase 2) |
-| Migrations | ⛔ None (Phase 2) |
-| Redis / Celery | ⛔ None (Phase 2) |
-| Docker / Compose | ⛔ None (Phase 2) |
+| Database models | ⛔ None (Phase 3+) |
+| Domain tables beyond extension bootstrap | ⛔ None (Phase 3+) |
 | Authentication / RBAC | ⛔ None (Phase 3) |
 | CI/CD | ⛔ None (Phase 14) |
-| Infrastructure | ⛔ None provisioned |
+| Infrastructure | ⚠️ Local development topology only; no production services provisioned |
 
-The repository contains documentation plus a runnable FastAPI foundation with no business functionality. This is deliberate.
+The repository now contains documentation plus a runnable FastAPI and worker foundation with PostgreSQL/Redis/Celery infrastructure but still no business functionality. This remains deliberate.
 
 ---
 
@@ -61,66 +60,84 @@ Delivered in `backend/`:
 | Application | `app/api/application.py` — `create_app` factory, lifespan, `/api/v1` router foundation |
 | Tests | `backend/tests/` — 100 tests across `unit/` and `integration/`, hermetic |
 
-Deliberately **not** built: database, Redis, Celery, Docker, authentication, RBAC, CSRF, business modules, CI.
-
 One new decision was recorded: **ADR-0013 — Standard API error envelope and error taxonomy**.
+
+### Phase 2 — Infrastructure foundation ✅
+
+Delivered in `backend/` and the repository root:
+
+| Area | What exists |
+|---|---|
+| Database runtime | `app/core/database.py` — SQLAlchemy 2.x async engine/session factory via `asyncpg`, bounded pools, UTC/timeouts, deterministic naming convention |
+| Redis runtime | `app/core/redis.py` — async Redis client lifecycle and tenant-safe `oc:{env}:t:{tenant_id}:...` key helper |
+| Celery | `app/core/celery_app.py`, `app/core/tasks.py`, `app/worker.py` — Redis broker, `critical`/`default`/`background` queues, smoke task, worker entrypoint |
+| Task context | `app/platform/task_context.py` — trusted `tenant_id`, `correlation_id`, `traceparent` propagation without mutable global state |
+| App wiring | `app/core/infrastructure.py`, updated `app/api/application.py`, updated dependencies, readiness checks for PostgreSQL and Redis |
+| Alembic | `backend/alembic.ini`, `backend/alembic/env.py`, `backend/alembic/script.py.mako`, initial extension-only migration |
+| Containers | `backend/Dockerfile`, `backend/.dockerignore`, `docker-compose.yml`, `Makefile`, `infra/postgres/init/10-roles.sql` |
+| Tests | Phase 2 pytest unit tests plus opt-in PostgreSQL/Redis integration tests; SQLite remains forbidden |
+| Dependencies | `backend/requirements.lock` committed as an explicitly temporary, offline-authored direct pin set |
+
+One new decision was recorded: **ADR-0014 — Async infrastructure foundation**.
 
 ---
 
 ## 3. Current phase
 
-**Phase 1 — complete. Awaiting explicit approval to begin Phase 2.**
+**Phase 2 — complete. Awaiting explicit approval to begin Phase 3.**
 
 ---
 
 ## 4. Current task
 
-None in progress.
+None in progress. The human operator will handle CI/CD verification separately.
 
 ---
 
 ## 5. Next task
 
-**Phase 2 — Configuration, Docker, PostgreSQL, Alembic, Redis, Celery** (do not start automatically; wait for explicit instruction).
+**Phase 3 — Identity** (do not start automatically; wait for explicit instruction).
 
-Scope when started:
+Expected scope when started:
 
-- Dockerfile (non-root, multi-stage) and Compose for local development
-- SQLAlchemy 2.x async engine, session management, `Base`, naming conventions
-- Alembic setup and the expand → migrate → contract workflow
-- Redis connection management
-- Celery application, queue routing, beat scheduling
-- PostgreSQL and Redis readiness checks registered into the existing health registry
-- Dependency lock file
-
-The Phase 1 structure was designed so none of this requires restructuring: the engine and pool open in the existing `lifespan`, their checks register into the existing `HealthRegistry`, their settings become new sections on the existing `Settings`, and their instrumentation attaches to the existing tracer provider.
+- Users, tenants, memberships, RBAC, audit logging
+- Opaque server-side sessions, password hashing, session rotation/revocation
+- CSRF double-submit protection and stricter browser-facing security controls
+- Tenant-scoped API keys and service-layer authorization hooks
 
 ---
 
 ## 6. How to run
 
 ```bash
-cd backend
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env
-
-uvicorn app.main:app --reload    # http://127.0.0.1:8000/health/live
-
-pytest                           # tests
-ruff check .                     # lint
-ruff format --check .            # formatting
-mypy                             # strict type checking
+cp backend/.env.example backend/.env
+docker compose up --build
 ```
 
-See `backend/README.md` for detail.
+Useful endpoints after startup:
+
+- `http://127.0.0.1:8000/health/live`
+- `http://127.0.0.1:8000/health/ready`
+
+Local quality commands (when the tools are available):
+
+```bash
+cd backend
+pytest
+ruff check .
+ruff format --check .
+mypy
+python -m compileall app tests alembic
+```
+
+Integration tests are opt-in and require `OC_TEST_DATABASE_URL` (real PostgreSQL via `asyncpg`) and `OC_TEST_REDIS_URL`.
 
 ---
 
 ## 7. Known issues
 
-- **The four quality gates have not been executed in a networked environment.** The Phase 1 code was authored in an offline sandbox with no package index, so `pytest`, `ruff check`, `ruff format --check` and `mypy` could not be installed or run. What *was* verified: every file byte-compiles under Python 3.13, `pyproject.toml` parses, and 49 pure-logic test functions (correlation, errors, health registry, logging) execute green under a stdlib harness. **Run all four gates locally before building on this foundation** and fix any findings in a follow-up commit.
-- No dependency lock file yet — see TODO P0.
+- **The four quality gates and the real-service integration tests were not executed in the offline authoring sandbox.** What *was* verified locally: `python -m compileall`, `pyproject.toml` parsing, `docker-compose.yml` YAML parsing, Alembic INI parsing, file inventory, and a high-signal secret-pattern scan. Run `pytest`, `ruff check`, `ruff format --check`, `mypy`, and the opt-in PostgreSQL/Redis integration tests in a networked environment before building on this foundation.
+- `backend/requirements.lock` is intentionally **not** a fully resolved production lock. It is a temporary offline-authored direct dependency pin set with no fabricated hashes or transitive claims. Regenerate it in CI or another networked environment.
 - Several architectural inputs remain unanswered; see the Open Questions section of `docs/architecture.md`. The most blocking are which channel launches first, whether AI replies auto-send at launch, the first AI provider/model, the initial plan matrix, and the production hosting and object storage providers.
 
 ---
@@ -134,7 +151,8 @@ See `backend/README.md` for detail.
 | Single-server Docker Compose production | Sufficient for first customers, low cost, low ops burden | CPU saturation, queue backlog, or zero-downtime deploy requirement |
 | Polling outbox dispatcher (no LISTEN/NOTIFY) | Simple, predictable, easy to reason about | Dispatch latency budget < 1 s becomes a product requirement |
 | `app/platform` shadows the stdlib `platform` module, `app/core/logging.py` shadows stdlib `logging` | Safe under Python 3 absolute imports; the names match the approved architecture and are worth more than the theoretical risk | Only if a dependency performs implicit relative imports (it will not) |
-| Quality gates unverified in CI | No network in the authoring environment | Phase 2, when Docker gives a reproducible environment; enforced in CI at Phase 14 |
+| Offline-authored dependency pin set | No resolver/network access in the authoring environment | Regenerated and validated in CI or another networked environment |
+| Quality gates unverified in CI | No network in the authoring environment | Phase 14, or earlier if a regression slips through |
 
 ---
 
