@@ -12,7 +12,9 @@ license = { text = "Proprietary" }
 
 # Runtime dependencies remain intentionally restrained. Phase 2 adds only the
 # infrastructure that now exists: PostgreSQL via asyncpg, SQLAlchemy, Alembic,
-# Redis, Celery, and the matching OpenTelemetry instrumentors.
+# Redis, Celery, and the matching OpenTelemetry instrumentors. Phase 3 adds
+# argon2-cffi, the reference Argon2id implementation required by
+# docs/security.md; password hashing is not something to hand-roll.
 dependencies = [
   "fastapi>=0.115.0,<0.116.0",
   "uvicorn[standard]>=0.32.0,<0.35.0",
@@ -23,6 +25,7 @@ dependencies = [
   "alembic>=1.14.0,<2.0.0",
   "redis>=5.2.0,<6.0.0",
   "celery[redis]>=5.4.0,<6.0.0",
+  "argon2-cffi>=23.1.0,<26.0.0",
   "opentelemetry-api>=1.27.0,<2.0.0",
   "opentelemetry-sdk>=1.27.0,<2.0.0",
   "opentelemetry-exporter-otlp-proto-http>=1.27.0,<2.0.0",
@@ -84,6 +87,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Tests may assert and may contain fake credential-shaped literals on purpose.
 "tests/**/*.py" = ["S101", "S105", "S106"]
+# Alembic migrations are generated-style DDL: long literal SQL and seed data
+# are the point of the file, not a smell.
+"alembic/versions/*.py" = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app"]
@@ -110,6 +116,13 @@ files = ["app", "tests"]
 [[tool.mypy.overrides]]
 # OpenTelemetry and Celery ship partial type information across their packages.
 module = ["opentelemetry.*", "celery.*", "kombu.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# argon2-cffi ships `py.typed`, but its C bindings module does not. This
+# silences the missing-stub error for the bindings only; our own call sites
+# stay fully type-checked.
+module = ["argon2.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
