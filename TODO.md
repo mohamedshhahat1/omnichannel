@@ -9,9 +9,8 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 ## P0 — Blocking
 
 ### Verify the Phase 2 foundation in a networked environment
-- [ ] Run `pytest`, `ruff check .`, `ruff format --check .`, and `mypy` in `backend/` on a machine with network access, and fix any findings
-  - The Phase 2 code was authored in an offline sandbox. Compilation, TOML/YAML/INI parsing, file inventory, and a high-signal secret-pattern scan were verified locally; the four gates themselves were not executed there.
-- [ ] Run opt-in PostgreSQL/Redis integration tests with `OC_TEST_DATABASE_URL` and `OC_TEST_REDIS_URL`
+- [x] Run `pytest`, `ruff check .`, `ruff format --check .`, and `mypy` in `backend/` on a machine with network access, and fix any findings
+- [x] Run opt-in PostgreSQL/Redis integration tests with `OC_TEST_DATABASE_URL` and `OC_TEST_REDIS_URL`
 - [ ] Regenerate `backend/requirements.lock` with a real resolver, transitive dependencies, and hashes; review the diff
 
 ### Decisions needed from the product owner
@@ -27,6 +26,9 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 - [ ] Opaque session issuance, rotation, revocation, and Argon2id password hashing
 - [ ] CSRF double-submit protection and strict CORS policy
 - [ ] Tenant-scoped API keys with hashed secrets, scopes, and rate limits
+
+### Completed in Phase 14 (Partial) ✅
+- [x] CI workflow created to automatically run Ruff, MyPy, Pytest and Docker Build on PRs and branch pushes
 
 ### Completed in Phase 2 ✅
 - [x] Dependency pin artifact committed with explicit offline limitation notes
