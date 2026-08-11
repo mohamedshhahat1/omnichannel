@@ -38,8 +38,14 @@ from app.api.middleware import (
 )
 from app.api.routes import health
 from app.api.routes.v1 import router as v1_router
+from app.core.infrastructure import start_infrastructure, stop_infrastructure
 from app.core.logging import configure_logging
-from app.core.observability import configure_tracing, instrument_fastapi, shutdown_tracing
+from app.core.observability import (
+    configure_tracing,
+    instrument_fastapi,
+    instrument_infrastructure,
+    shutdown_tracing,
+)
 from app.core.settings import Settings, get_settings
 from app.platform.health import HealthRegistry
 
@@ -60,6 +66,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     `yield`, including when startup itself fails part way through.
     """
     settings: Settings = app.state.settings
+
+    # Preserve hermetic API/integration tests. Real PostgreSQL/Redis checks are
+    # opt-in and use explicit OC_TEST_* URLs in the dedicated integration suite.
+    if settings.is_test:
+        logger.info(
+            "application.startup",
+            extra={
+                "environment": settings.environment.value,
+                "version": settings.service_version,
+                "tracing_enabled": settings.observability.tracing_enabled,
+            },
+        )
+        app.state.started = True
+        try:
+            yield
+        finally:
+            app.state.started = False
+            shutdown_tracing(app.state.tracer_provider)
+            logger.info("application.shutdown")
+        return
+
+    infrastructure = await start_infrastructure(settings, app.state.health_registry)
+    app.state.infrastructure = infrastructure
+    app.state.database_engine = infrastructure.database_engine
+    app.state.session_factory = infrastructure.session_factory
+    app.state.redis = infrastructure.redis
+    instrument_infrastructure(infrastructure.database_engine, infrastructure.redis, settings)
+
     logger.info(
         "application.startup",
         extra={
@@ -73,6 +107,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         app.state.started = False
+        await stop_infrastructure(infrastructure)
         shutdown_tracing(app.state.tracer_provider)
         logger.info("application.shutdown")
 
@@ -101,6 +136,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.health_registry = HealthRegistry()
     app.state.tracer_provider = tracer_provider
     app.state.started = False
+    app.state.infrastructure = None
 
     _register_middleware(app, settings)
     register_exception_handlers(app)
