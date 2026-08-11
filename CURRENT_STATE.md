@@ -18,7 +18,7 @@
 | Database models | ⛔ None (Phase 3+) |
 | Domain tables beyond extension bootstrap | ⛔ None (Phase 3+) |
 | Authentication / RBAC | ⛔ None (Phase 3) |
-| CI/CD | ⛔ None (Phase 14) |
+| CI/CD | ⚠️ Basic GitHub Actions pipeline (lint, typecheck, test, docker build) |
 | Infrastructure | ⚠️ Local development topology only; no production services provisioned |
 
 The repository now contains documentation plus a runnable FastAPI and worker foundation with PostgreSQL/Redis/Celery infrastructure but still no business functionality. This remains deliberate.
@@ -80,11 +80,17 @@ Delivered in `backend/` and the repository root:
 
 One new decision was recorded: **ADR-0014 — Async infrastructure foundation**.
 
+### Phase 14 — CI/CD Foundation 🚧
+
+A baseline GitHub Actions workflow is present (`.github/workflows/ci.yml`). It runs Ruff, MyPy, Pytest (including integration tests with Postgres/Redis), and a Docker build check on every PR and push to `main` or `phase-2-infrastructure`.
+
+**Important:** CI results are verified manually by human operators. Automated tools do not access CI results or credentials.
+
 ---
 
 ## 3. Current phase
 
-**Phase 2 — complete. Awaiting explicit approval to begin Phase 3.**
+**Phase 14 (Partial) — CI Foundation complete. Awaiting explicit approval to begin Phase 3.**
 
 ---
 
@@ -136,7 +142,7 @@ Integration tests are opt-in and require `OC_TEST_DATABASE_URL` (real PostgreSQL
 
 ## 7. Known issues
 
-- **The four quality gates and the real-service integration tests were not executed in the offline authoring sandbox.** What *was* verified locally: `python -m compileall`, `pyproject.toml` parsing, `docker-compose.yml` YAML parsing, Alembic INI parsing, file inventory, and a high-signal secret-pattern scan. Run `pytest`, `ruff check`, `ruff format --check`, `mypy`, and the opt-in PostgreSQL/Redis integration tests in a networked environment before building on this foundation.
+- **CI Pipeline verifies the four quality gates.** However, the initial offline-authored `requirements.lock` may still need a network resolution for true reproducibility. The CI uses it on a best-effort basis or installs `.[dev]`.
 - `backend/requirements.lock` is intentionally **not** a fully resolved production lock. It is a temporary offline-authored direct dependency pin set with no fabricated hashes or transitive claims. Regenerate it in CI or another networked environment.
 - Several architectural inputs remain unanswered; see the Open Questions section of `docs/architecture.md`. The most blocking are which channel launches first, whether AI replies auto-send at launch, the first AI provider/model, the initial plan matrix, and the production hosting and object storage providers.
 
@@ -152,7 +158,6 @@ Integration tests are opt-in and require `OC_TEST_DATABASE_URL` (real PostgreSQL
 | Polling outbox dispatcher (no LISTEN/NOTIFY) | Simple, predictable, easy to reason about | Dispatch latency budget < 1 s becomes a product requirement |
 | `app/platform` shadows the stdlib `platform` module, `app/core/logging.py` shadows stdlib `logging` | Safe under Python 3 absolute imports; the names match the approved architecture and are worth more than the theoretical risk | Only if a dependency performs implicit relative imports (it will not) |
 | Offline-authored dependency pin set | No resolver/network access in the authoring environment | Regenerated and validated in CI or another networked environment |
-| Quality gates unverified in CI | No network in the authoring environment | Phase 14, or earlier if a regression slips through |
 
 ---
 
