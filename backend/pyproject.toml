@@ -1,0 +1,118 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "omnichannel-backend"
+version = "0.1.0"
+description = "Omnichannel AI customer conversation platform - backend"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "Proprietary" }
+
+# Runtime dependencies are deliberately minimal.
+# PostgreSQL, Redis, Celery, S3, LLM, Meta and Paddle dependencies are added by
+# the phase that actually implements them - see CURRENT_STATE.md.
+#
+# Version policy: declare compatible ranges here, and pin exact versions in a
+# lock file (generated in Phase 2 alongside the Docker build) so that CI and
+# production install byte-identical dependency sets.
+dependencies = [
+  "fastapi>=0.115.0,<0.116.0",
+  "uvicorn[standard]>=0.32.0,<0.35.0",
+  "pydantic>=2.9.0,<3.0.0",
+  "pydantic-settings>=2.5.0,<3.0.0",
+  "opentelemetry-api>=1.27.0,<2.0.0",
+  "opentelemetry-sdk>=1.27.0,<2.0.0",
+  "opentelemetry-exporter-otlp-proto-http>=1.27.0,<2.0.0",
+  "opentelemetry-instrumentation-fastapi>=0.48b0,<1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0,<9.0.0",
+  "httpx>=0.27.0,<0.29.0",
+  "ruff>=0.8.0,<0.13.0",
+  "mypy>=1.13.0,<2.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# ---------------------------------------------------------------------------
+# Ruff - formatting and linting
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "tests"]
+extend-exclude = [".venv", "venv"]
+
+[tool.ruff.lint]
+select = [
+  "E",     # pycodestyle errors
+  "W",     # pycodestyle warnings
+  "F",     # pyflakes
+  "I",     # import sorting
+  "N",     # pep8-naming
+  "UP",    # pyupgrade
+  "B",     # bugbear
+  "C4",    # comprehensions
+  "SIM",   # simplify
+  "RET",   # return semantics
+  "ARG",   # unused arguments
+  "PTH",   # prefer pathlib
+  "DTZ",   # timezone-aware datetimes
+  "T20",   # no print (ENGINEERING.md 8.5)
+  "ASYNC", # async correctness
+  "S",     # security (bandit)
+  "RUF",   # ruff-specific
+  "TID",   # tidy imports
+]
+ignore = [
+  "E501",   # line length is governed by the formatter
+  "B008",   # FastAPI dependency defaults are idiomatic
+  "RET504", # named returns often aid readability
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may assert and may contain fake credential-shaped literals on purpose.
+"tests/**/*.py" = ["S101", "S105", "S106"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+# Absolute imports only - makes module boundaries explicit and greppable.
+ban-relative-imports = "all"
+
+[tool.ruff.format]
+docstring-code-format = false
+
+# ---------------------------------------------------------------------------
+# MyPy - static typing
+# ---------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+show_error_codes = true
+plugins = ["pydantic.mypy"]
+files = ["app", "tests"]
+
+[[tool.mypy.overrides]]
+# OpenTelemetry ships partial type information across its many packages.
+module = ["opentelemetry.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+pythonpath = ["."]
