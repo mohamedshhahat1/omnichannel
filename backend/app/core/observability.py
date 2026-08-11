@@ -1,12 +1,15 @@
 """OpenTelemetry bootstrap (ADR-0010).
 
-Phase 1 establishes the foundation only:
+Phase 1 established the foundation only:
 
 - a tracer provider with correct service resource attributes,
 - a configurable exporter (`none`, `console`, `otlp`),
 - W3C trace context and baggage as the global propagators,
 - FastAPI instrumentation,
 - clean shutdown that flushes buffered spans.
+
+Phase 2 keeps those guarantees and adds optional instrumentation hooks for the
+async SQLAlchemy engine and Redis client that are created during lifespan.
 
 Tracing is disabled by default, so local development and CI need no tracing
 backend. Even when disabled, `current_trace_ids` degrades quietly to `None`,
@@ -33,6 +36,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from opentelemetry.sdk.trace import TracerProvider
+    from redis.asyncio import Redis
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
     from app.core.settings import Settings
 
@@ -128,6 +133,23 @@ def instrument_fastapi(app: FastAPI, settings: Settings) -> None:
         excluded_urls=settings.observability.excluded_urls or None,
     )
     logger.info("observability.instrumentation.fastapi.enabled")
+
+
+def instrument_infrastructure(
+    engine: AsyncEngine,
+    redis_client: Redis,
+    settings: Settings,
+) -> None:
+    """Attach SQLAlchemy and Redis instrumentation when tracing is enabled."""
+    if not settings.observability.tracing_enabled:
+        return
+
+    from opentelemetry.instrumentation.redis import RedisInstrumentor
+    from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+
+    SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine)
+    RedisInstrumentor().instrument_client(redis_client)
+    logger.info("observability.instrumentation.infrastructure.enabled")
 
 
 def shutdown_tracing(provider: TracerProvider | None) -> None:
