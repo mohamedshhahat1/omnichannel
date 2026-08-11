@@ -16,8 +16,8 @@ Adding a settings group in a later phase is three steps:
 3. Document the variables in `.env.example`.
 
 Secrets use `pydantic.SecretStr` so they cannot be printed or logged by
-accident. Phase 1 needs no secrets, so none are defined yet - a setting is
-added by the phase that consumes it, not in advance.
+accident. Phase 2 keeps example credentials only in the local example env file;
+production secrets remain external.
 """
 
 from enum import StrEnum
@@ -115,6 +115,64 @@ class SecuritySettings(SettingsSection):
     hsts_max_age_seconds: int = Field(default=63_072_000, ge=0)
 
 
+class DatabaseSettings(SettingsSection):
+    """Async SQLAlchemy + asyncpg configuration."""
+
+    url: str = "postgresql+asyncpg://oc_app:oc_app_password@postgres:5432/omnichannel"
+    migration_url: str = (
+        "postgresql+asyncpg://oc_migrator:oc_migrator_password@postgres:5432/omnichannel"
+    )
+    pool_size: int = Field(default=5, ge=1, le=100)
+    max_overflow: int = Field(default=5, ge=0, le=100)
+    pool_timeout_seconds: float = Field(default=5.0, gt=0)
+    pool_recycle_seconds: int = Field(default=1800, ge=60)
+    statement_timeout_ms: int = Field(default=10_000, ge=100)
+    lock_timeout_ms: int = Field(default=2_000, ge=100)
+    health_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+
+    @model_validator(mode="after")
+    def _validate_urls(self) -> Self:
+        for field_name, value in (("url", self.url), ("migration_url", self.migration_url)):
+            if not value.startswith("postgresql+asyncpg://"):
+                raise ValueError(f"database.{field_name} must use postgresql+asyncpg")
+        return self
+
+
+class RedisSettings(SettingsSection):
+    """Redis client configuration."""
+
+    url: str = "redis://redis:6379/0"
+    max_connections: int = Field(default=20, ge=1, le=1000)
+    socket_connect_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    socket_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    health_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+
+
+class CelerySettings(SettingsSection):
+    """Celery broker and queue configuration."""
+
+    broker_url: str = "redis://redis:6379/1"
+    result_backend_enabled: bool = False
+    result_backend_url: str | None = None
+    default_queue: str = "default"
+    critical_queue: str = "critical"
+    background_queue: str = "background"
+    task_soft_time_limit_seconds: int = Field(default=270, ge=1)
+    task_time_limit_seconds: int = Field(default=300, ge=2)
+    worker_prefetch_multiplier: int = Field(default=1, ge=1, le=16)
+
+    @model_validator(mode="after")
+    def _validate_backend_and_queues(self) -> Self:
+        if self.result_backend_enabled and not self.result_backend_url:
+            raise ValueError("celery.result_backend_url is required when enabled")
+        if self.task_soft_time_limit_seconds >= self.task_time_limit_seconds:
+            raise ValueError("celery soft time limit must be below hard time limit")
+        queue_names = {self.default_queue, self.critical_queue, self.background_queue}
+        if len(queue_names) != 3 or any(not value.strip() for value in queue_names):
+            raise ValueError("celery queue names must be non-empty and distinct")
+        return self
+
+
 class Settings(BaseSettings):
     """Root application settings."""
 
@@ -130,13 +188,16 @@ class Settings(BaseSettings):
     environment: Environment = Environment.DEVELOPMENT
     debug: bool = False
     service_name: str = "omnichannel-api"
-    service_version: str = "0.1.0"
+    service_version: str = "0.2.0"
     api_prefix: str = "/api"
 
     server: ServerSettings = Field(default_factory=ServerSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
+    database: DatabaseSettings = Field(default_factory=DatabaseSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
+    celery: CelerySettings = Field(default_factory=CelerySettings)
 
     @property
     def is_production(self) -> bool:
