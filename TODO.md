@@ -2,15 +2,17 @@
 
 Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **P1** = required before real production traffic · **P2** = valuable, scheduled later.
 
-> Phase 0 (architecture + documentation) and Phase 1 (application foundation) are complete. Do not start Phase 2 without explicit approval.
+> Phase 0 (architecture + documentation), Phase 1 (application foundation), and Phase 2 (infrastructure foundation) are complete. Do not start Phase 3 without explicit approval.
 
 ---
 
 ## P0 — Blocking
 
-### Verify the Phase 1 foundation locally
-- [ ] Run `pytest`, `ruff check .`, `ruff format --check .` and `mypy` in `backend/` on a machine with network access, and fix any findings
-  - The Phase 1 code was authored offline with no package index available. Compilation, `pyproject.toml` parsing and the pure-logic tests were verified; the four gates themselves were not executed. See CURRENT_STATE section 7.
+### Verify the Phase 2 foundation in a networked environment
+- [ ] Run `pytest`, `ruff check .`, `ruff format --check .`, and `mypy` in `backend/` on a machine with network access, and fix any findings
+  - The Phase 2 code was authored in an offline sandbox. Compilation, TOML/YAML/INI parsing, file inventory, and a high-signal secret-pattern scan were verified locally; the four gates themselves were not executed there.
+- [ ] Run opt-in PostgreSQL/Redis integration tests with `OC_TEST_DATABASE_URL` and `OC_TEST_REDIS_URL`
+- [ ] Regenerate `backend/requirements.lock` with a real resolver, transitive dependencies, and hashes; review the diff
 
 ### Decisions needed from the product owner
 - [ ] Choose the first channel to launch (WhatsApp / Instagram DM / Messenger / comments)
@@ -20,16 +22,23 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 - [ ] Choose the production host and the S3-compatible storage provider
 - [ ] Confirm the frontend approach for the dashboard (affects CORS/cookie configuration)
 
-### Phase 2 readiness (do not start until approved)
-- [ ] Dependency lock file so installs are reproducible across machines and CI (`uv.lock`, or `pip-compile` output committed as `requirements.lock`)
-- [ ] Dockerfile for API and worker: multi-stage, non-root user, minimal base, no build toolchain in the runtime layer
-- [ ] Docker Compose for local development (API, PostgreSQL, Redis, worker, beat)
-- [ ] SQLAlchemy 2.x async engine, session lifecycle, declarative `Base`, constraint naming convention
-- [ ] Alembic configuration and the expand → migrate → contract workflow
-- [ ] Redis connection management and key namespacing (`oc:{env}:t:{tenant_id}:...`)
-- [ ] Celery application, queue routing, beat schedule, task base class carrying `tenant_id` / `correlation_id` / `traceparent`
-- [ ] Register PostgreSQL and Redis checks into the existing `HealthRegistry` from the application lifespan — do not modify the readiness endpoint
-- [ ] Extend `Settings` with `database`, `redis` and `celery` sections following the existing pattern
+### Phase 3 readiness (do not start until approved)
+- [ ] Identity module: users, auth sessions, tenants, memberships, RBAC, audit log
+- [ ] Opaque session issuance, rotation, revocation, and Argon2id password hashing
+- [ ] CSRF double-submit protection and strict CORS policy
+- [ ] Tenant-scoped API keys with hashed secrets, scopes, and rate limits
+
+### Completed in Phase 2 ✅
+- [x] Dependency pin artifact committed with explicit offline limitation notes
+- [x] Dockerfile for API and worker: multi-stage, non-root user, minimal base
+- [x] Docker Compose for local development (API, PostgreSQL, Redis, worker, beat, migration)
+- [x] SQLAlchemy 2.x async engine, session lifecycle, declarative `Base`, constraint naming convention
+- [x] Alembic configuration and the initial extensions migration
+- [x] Redis connection management and key namespacing (`oc:{env}:t:{tenant_id}:...`)
+- [x] Celery application, queue routing, smoke task, and task context carrying `tenant_id` / `correlation_id` / `traceparent`
+- [x] PostgreSQL and Redis checks registered into the existing `HealthRegistry` from the application lifespan
+- [x] `Settings` extended with `database`, `redis`, and `celery` sections following the existing pattern
+- [x] Phase 2 unit tests and opt-in real PostgreSQL/Redis integration tests added
 
 ### Completed in Phase 1 ✅
 - [x] `backend/` project skeleton and `pyproject.toml`
@@ -47,11 +56,6 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 ## P1 — Before production traffic
 
 ### Security
-- [ ] Argon2id password hashing with tuned parameters
-- [ ] Opaque session issuance, rotation, sliding/absolute expiry, revocation
-- [ ] CSRF double-submit protection and strict CORS policy
-- [ ] Email verification and password reset flows (hashed, single-use, expiring tokens)
-- [ ] Tenant-scoped API keys with hashed secrets, scopes and rate limits
 - [ ] Meta and Paddle webhook signature verification with replay protection
 - [ ] Central authorisation checks in the service layer, with per-permission tests
 - [ ] Cross-tenant isolation test suite (database, Redis, object storage, retrieval, tools)
@@ -75,7 +79,6 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 - [ ] Retry policies with exponential backoff and jitter for every external call
 
 ### Testing
-- [ ] Integration test harness with real PostgreSQL and Redis
 - [ ] Webhook test matrix: valid, invalid signature, duplicate, out-of-order, malformed
 - [ ] Outbox tests: crash-before-commit, crash-before-dispatch, crash-before-ack, duplicate publish
 - [ ] Migration upgrade path executed in CI
@@ -119,6 +122,6 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 | Single-server production | Cost and operational simplicity | CPU saturation, queue backlog, or zero-downtime deploys required |
 | `handoff` as a sub-package | Avoids premature module fragmentation | Routing, SLAs or skills-based assignment appear |
 | Sentry as the initial trace sink | Avoids running a trace backend early | Trace volume or retention needs justify Tempo/Jaeger |
-| No dependency lock file | Phase 1 has no reproducible-build requirement yet | Phase 2, before Docker images are built |
+| Offline-authored dependency pin set | No resolver/network in the authoring environment | Regenerated in CI or another networked environment |
 | Quality gates run manually, not in CI | CI is Phase 14; running them locally is cheap | Phase 14, or earlier if a regression slips through |
 | `app/platform` and `app/core/logging.py` shadow stdlib module names | Safe under Python 3 absolute imports; names match the approved architecture | Only if a dependency performs implicit relative imports |
