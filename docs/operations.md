@@ -1,6 +1,8 @@
 # Operations
 
 > Backup and disaster recovery, runbooks, incident response and routine maintenance.
+>
+> **Phase 2 status:** the repository now includes the local PostgreSQL/Redis/Celery topology, least-privileged local PostgreSQL roles, readiness checks, and migration bootstrap. Production backup automation, WAL archiving, monitoring-backed alerts, and restore rehearsal remain future operational work.
 
 ---
 
@@ -124,6 +126,8 @@ Generate the new secret → support both old and new during the overlap where th
 | Weekly | Slow-query review · disk and table growth · dependency alerts · open incidents |
 | Monthly | **Automated restore verification** · security patching · index and cost review · alert-threshold tuning |
 | Quarterly | Access review (users, API keys, roles) · key rotation · DR rehearsal · capacity review · documentation audit |
+
+**Phase 2 local-only additions:** verify the migration container still upgrades cleanly, the Compose services remain healthy, and the offline-authored `requirements.lock` has not been mistaken for a production-grade resolved lock.
 
 ---
 
