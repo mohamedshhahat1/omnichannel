@@ -1,6 +1,6 @@
 # Deployment
 
-> Local development, CI/CD and production topology. **Phase 2 implements the local infrastructure foundation** — Dockerfile, Compose services for API/PostgreSQL/Redis/worker/beat/migrate, a one-shot Alembic migration container, and a non-root runtime image. CI/CD workflows are still future work.
+> Local development, CI/CD and production topology. **Phase 2 implements the local infrastructure foundation** — Dockerfile, Compose services for API/PostgreSQL/Redis/worker/beat/migrate, a one-shot Alembic migration container, and a non-root runtime image. **CI is implemented** (`.github/workflows/ci.yml`; see §4). CD remains future work.
 
 ---
 
@@ -53,21 +53,23 @@ Developer workflow: `docker compose up` → run migrations → seed → develop.
 
 ## 4. CI (GitHub Actions)
 
-Pipeline on every pull request and on `main`:
+**Implemented:** `.github/workflows/ci.yml` runs on every pull request and on pushes to `main` and `phase-2-infrastructure`, with least-privilege permissions (`contents: read`), pip caching keyed on `backend/requirements.lock`, no secrets, no registry pushes and no deployment. Each check is a separate required job:
 
-1. Checkout, set up Python, restore cache
-2. Install locked dependencies
-3. **Format check** (Ruff format)
-4. **Lint** (Ruff)
-5. **Type check** (MyPy)
-6. **Unit tests**
-7. **Integration tests** against service containers (PostgreSQL + Redis)
-8. **Migration validation** — run the full upgrade path on an empty database, and check for model/migration drift
-9. **Security** — dependency vulnerability scan, secret scanning, static analysis
-10. **Docker build** (and image scan)
-11. Coverage report
+1. **Ruff lint** (`ruff check .`)
+2. **Ruff format** (`ruff format --check .`)
+3. **MyPy** (`mypy`, strict)
+4. **Unit tests** (`pytest -m "not integration"`)
+5. **Integration tests** (`pytest -m "integration"`) against real service containers — `pgvector/pgvector:pg16` and `redis:7-alpine`, the same images as Compose — using the committed role bootstrap (`infra/postgres/init/10-roles.sql`) and `alembic upgrade head` first. SQLite is never substituted; Redis is never faked. The database is ephemeral with CI-only credentials; no repository secrets are used.
+6. **Docker build** of the production `backend/Dockerfile` (build only; nothing is pushed)
+7. **Compose validation** (`docker compose config`; the Compose file interpolates no environment variables, so no dummy values are required)
 
-All checks are required. **A failing required check blocks merge and blocks deployment.** Branch protection on `main`: no direct pushes, review required, checks required.
+Python 3.13 is used, matching `backend/Dockerfile` (`python:3.13-slim`) within the `>=3.12,<3.14` range declared by `backend/pyproject.toml`. Dependencies install from `backend/requirements.lock`, the documented temporary offline-authored pin set; transitive dependencies float until the lock is regenerated in a networked environment.
+
+**Interpreting failures:** a red job fails the pipeline and blocks merge. Reproduce locally with the same command (`cd backend && ruff check .`, `ruff format --check .`, `mypy`, `pytest`, or `docker build -t omnichannel-backend:ci backend`, `docker compose config`). **CI results are verified by the human operator; automated agents (including Opus) must not access GitHub Actions results or request CI credentials or tokens.**
+
+Still future work: migration-drift validation, dependency vulnerability scanning, secret scanning, static analysis, image scanning and coverage reporting. Branch protection on `main` (no direct pushes, review required, checks required) is configured by the repository owner.
+
+All checks are required. **A failing required check blocks merge and blocks deployment.**
 
 ---
 

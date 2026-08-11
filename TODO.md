@@ -27,8 +27,10 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 - [ ] CSRF double-submit protection and strict CORS policy
 - [ ] Tenant-scoped API keys with hashed secrets, scopes, and rate limits
 
-### Completed in Phase 14 (Partial) ✅
-- [x] CI workflow created to automatically run Ruff, MyPy, Pytest and Docker Build on PRs and branch pushes
+### Completed in Phase 14 ✅
+- [x] CI workflow (`.github/workflows/ci.yml`) with seven separate required checks on every PR and every push to `main`/`phase-2-infrastructure`: Ruff lint, Ruff format, MyPy, unit Pytest, integration Pytest against real PostgreSQL/Redis service containers, production Docker image build (no push), and `docker compose config` validation — no secrets, least-privilege `contents: read`
+- [x] CI guardrail test (`backend/tests/unit/test_ci_workflow.py`) validating workflow paths, Python version, commands, working directories, dependency installation and service configuration
+- [x] Fixed the hermetic test environment stripping `OC_TEST_*`, which would have silently skipped the opt-in Phase 2 integration tests in CI
 
 ### Completed in Phase 2 ✅
 - [x] Dependency pin artifact committed with explicit offline limitation notes
@@ -125,5 +127,4 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 | `handoff` as a sub-package | Avoids premature module fragmentation | Routing, SLAs or skills-based assignment appear |
 | Sentry as the initial trace sink | Avoids running a trace backend early | Trace volume or retention needs justify Tempo/Jaeger |
 | Offline-authored dependency pin set | No resolver/network in the authoring environment | Regenerated in CI or another networked environment |
-| Quality gates run manually, not in CI | CI is Phase 14; running them locally is cheap | Phase 14, or earlier if a regression slips through |
 | `app/platform` and `app/core/logging.py` shadow stdlib module names | Safe under Python 3 absolute imports; names match the approved architecture | Only if a dependency performs implicit relative imports |

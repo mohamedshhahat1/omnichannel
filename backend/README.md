@@ -65,7 +65,7 @@ id when reporting a problem — it appears on every log line for that request.
 
 ## Quality gates
 
-Run all four before pushing. CI will enforce them from Phase 14.
+Run all four before pushing. CI (`.github/workflows/ci.yml`) enforces them on every pull request and on pushes to `main` and `phase-2-infrastructure`, alongside integration tests against real PostgreSQL/Redis services, a production Docker image build, and Compose config validation.
 
 ```bash
 pytest                 # test suite

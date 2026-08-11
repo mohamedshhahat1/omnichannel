@@ -18,7 +18,7 @@
 | Database models | ⛔ None (Phase 3+) |
 | Domain tables beyond extension bootstrap | ⛔ None (Phase 3+) |
 | Authentication / RBAC | ⛔ None (Phase 3) |
-| CI/CD | ⚠️ Basic GitHub Actions pipeline (lint, typecheck, test, docker build) |
+| CI/CD | ✅ GitHub Actions pipeline (Ruff lint, Ruff format, MyPy, unit + integration Pytest on real PostgreSQL/Redis, Docker build, Compose validation) |
 | Infrastructure | ⚠️ Local development topology only; no production services provisioned |
 
 The repository now contains documentation plus a runnable FastAPI and worker foundation with PostgreSQL/Redis/Celery infrastructure but still no business functionality. This remains deliberate.
@@ -80,11 +80,13 @@ Delivered in `backend/` and the repository root:
 
 One new decision was recorded: **ADR-0014 — Async infrastructure foundation**.
 
-### CI/CD Foundation 🚧
+### CI/CD Foundation ✅
 
-A baseline GitHub Actions workflow is present (`.github/workflows/ci.yml`). It runs Ruff, MyPy, Pytest (including integration tests with Postgres/Redis), and a Docker build check on every PR and push to `main` or `phase-2-infrastructure`.
+Delivered `.github/workflows/ci.yml` on `phase-2-infrastructure`. Triggers: every pull request and every push to `main` or `phase-2-infrastructure`. Seven separate required checks, each a named job: `ruff-lint`, `ruff-format`, `mypy`, `pytest-unit`, `pytest-integration` (real `pgvector/pgvector:pg16` and `redis:7-alpine` service containers, the committed role bootstrap, and `alembic upgrade head` first), `docker-build` (production `backend/Dockerfile`; build only, nothing pushed), and `compose-config` (`docker compose config`). Least-privilege permissions (`contents: read`), no secrets, pip caching keyed on `backend/requirements.lock`, no `continue-on-error`. `backend/tests/unit/test_ci_workflow.py` guards the workflow definition (paths, Python version, commands, working directories, dependency installation, service configuration, permissions).
 
-**Important:** CI results are verified manually by human operators. Automated tools do not access CI results or credentials.
+**How to interpret failures:** each check is a separate job; a red job fails the pipeline and blocks merge. Reproduce locally with the matching command: `cd backend && ruff check .` / `ruff format --check .` / `mypy` / `pytest -m "not integration"` / `pytest -m "integration"`, or `docker build -t omnichannel-backend:ci backend` / `docker compose config` from the repository root.
+
+**Important:** CI results are verified manually by the human operator. Automated agents (including Opus) must not access GitHub Actions results, inspect workflow runs, or request CI credentials or tokens.
 
 ---
 
@@ -142,7 +144,7 @@ Integration tests are opt-in and require `OC_TEST_DATABASE_URL` (real PostgreSQL
 
 ## 7. Known issues
 
-- **CI Pipeline verifies the four quality gates.** However, the initial offline-authored `requirements.lock` may still need a network resolution for true reproducibility. The CI uses it on a best-effort basis or installs `.[dev]`.
+- **CI verifies all quality gates** (Ruff lint, Ruff format, MyPy, unit + integration Pytest, Docker build, Compose validation). However, the initial offline-authored `requirements.lock` is still a direct-pin set only: CI installs from it as documented, and transitive dependencies float until the lock is regenerated with a networked resolver (P0).
 - `backend/requirements.lock` is intentionally **not** a fully resolved production lock. It is a temporary offline-authored direct dependency pin set with no fabricated hashes or transitive claims. Regenerate it in CI or another networked environment.
 - Several architectural inputs remain unanswered; see the Open Questions section of `docs/architecture.md`. The most blocking are which channel launches first, whether AI replies auto-send at launch, the first AI provider/model, the initial plan matrix, and the production hosting and object storage providers.
 

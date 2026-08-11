@@ -3,7 +3,10 @@
 Tests are hermetic: no network, no external services, and no dependence on the
 developer's shell environment. `OC_`-prefixed variables are stripped before
 every test and settings are built with `_env_file=None`, so a stray export
-cannot make the suite pass or fail by accident.
+cannot make the suite pass or fail by accident. The documented `OC_TEST_*`
+opt-in integration URLs (see `.env.example`) are the one exception: they are
+read directly by `tests/integration/conftest.py`, and stripping them would
+silently skip every Phase 2 integration test.
 """
 
 import os
@@ -33,7 +36,10 @@ def build_settings(**overrides: Any) -> Settings:
 def isolated_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Remove application environment variables and reset the settings cache."""
     for key in list(os.environ):
-        if key.startswith("OC_"):
+        # Keep the documented OC_TEST_* opt-in integration URLs; they are not
+        # application settings and tests/integration/conftest.py reads them
+        # directly via os.getenv.
+        if key.startswith("OC_") and not key.startswith("OC_TEST_"):
             monkeypatch.delenv(key, raising=False)
     get_settings.cache_clear()
     yield
