@@ -23,6 +23,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.schemas import build_error_envelope
 from app.core.errors import AppError, UnprocessableEntityError
+from app.platform.correlation import CorrelationIds, CorrelationTokens, bind, unbind
 
 logger = logging.getLogger(__name__)
 
@@ -161,11 +162,24 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> Respo
         },
         exc_info=exc,
     )
-    return _json_error(
-        status_code=500,
-        code="internal_error",
-        message=_GENERIC_SERVER_MESSAGE,
-    )
+    # This handler runs in Starlette's ServerErrorMiddleware, outside the
+    # correlation middleware, so the ambient identifiers were already unbound
+    # while the exception unwound the stack. Recover them from request.state,
+    # where the correlation middleware stores them for exactly this purpose.
+    request_id: str | None = getattr(request.state, "request_id", None)
+    correlation_id: str | None = getattr(request.state, "correlation_id", None)
+    tokens: CorrelationTokens | None = None
+    if request_id is not None and correlation_id is not None:
+        tokens = bind(CorrelationIds(request_id=request_id, correlation_id=correlation_id))
+    try:
+        return _json_error(
+            status_code=500,
+            code="internal_error",
+            message=_GENERIC_SERVER_MESSAGE,
+        )
+    finally:
+        if tokens is not None:
+            unbind(tokens)
 
 
 def register_exception_handlers(app: FastAPI) -> None:

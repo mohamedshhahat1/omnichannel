@@ -45,7 +45,7 @@ def test_defaults_are_safe_for_local_development() -> None:
 
 
 def test_environment_predicates() -> None:
-    assert make_settings(environment=Environment.PRODUCTION).is_production
+    assert production_settings().is_production
     assert make_settings(environment=Environment.TEST).is_test
     assert make_settings(environment=Environment.DEVELOPMENT).is_development
 
@@ -53,12 +53,12 @@ def test_environment_predicates() -> None:
 def test_settings_are_immutable() -> None:
     settings = make_settings()
     with pytest.raises(ValidationError):
-        settings.debug = True
+        settings.debug = True  # type: ignore[misc]
 
 
 def test_sections_reject_unknown_keys() -> None:
     with pytest.raises(ValidationError):
-        ServerSettings(prot=8000)
+        ServerSettings(prot=8000)  # type: ignore[call-arg]
 
 
 def test_port_and_sample_ratio_bounds_are_enforced() -> None:

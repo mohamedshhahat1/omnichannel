@@ -70,7 +70,9 @@ def test_overlong_inbound_correlation_id_is_replaced(client: TestClient) -> None
 
 def test_identifiers_are_available_to_handlers(app: FastAPI) -> None:
     @app.get("/_test/context")
-    async def context(request: Request, request_context: RequestContextDep) -> dict[str, str]:
+    async def context(
+        request: Request, request_context: RequestContextDep
+    ) -> dict[str, str | None]:
         return {
             "from_dependency": request_context.request_id,
             "from_state": request.state.request_id,

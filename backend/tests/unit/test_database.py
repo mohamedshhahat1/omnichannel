@@ -33,7 +33,9 @@ def test_metadata_has_stable_constraint_names_and_no_phase2_tables() -> None:
     convention = Base.metadata.naming_convention
     assert convention is not None
     assert convention["pk"] == "%(table_name)s_pk"
-    assert convention["fk"].startswith("fk_")
+    fk = convention["fk"]
+    assert isinstance(fk, str)
+    assert fk.startswith("fk_")
     assert list(Base.metadata.tables) == []
 
 

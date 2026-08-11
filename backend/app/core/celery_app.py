@@ -12,7 +12,9 @@ from app.platform.correlation import CorrelationIds, bind, unbind
 from app.platform.task_context import task_context, task_context_from_headers
 
 
-class ContextTask(Task):
+# Celery ships no type stubs, so Task is Any and subclassing it needs a
+# targeted suppression under --strict (see the mypy overrides in pyproject).
+class ContextTask(Task):  # type: ignore[misc]
     """Require tenant/correlation headers and bind them only for this task call."""
 
     abstract = True

@@ -14,9 +14,7 @@ _SEGMENT: Final = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 
 def _safe_segment(name: str, value: str) -> str:
     if not value or not _SEGMENT.fullmatch(value):
-        raise ValueError(
-            f"{name} must contain only letters, digits, dot, underscore, or hyphen"
-        )
+        raise ValueError(f"{name} must contain only letters, digits, dot, underscore, or hyphen")
     return value
 
 
@@ -34,7 +32,7 @@ def tenant_key(environment: str, tenant_id: str, purpose: str, *parts: str) -> s
 
 
 def create_redis_client(settings: RedisSettings) -> Redis:
-    return Redis.from_url(
+    client: Redis = Redis.from_url(
         settings.url,
         encoding="utf-8",
         decode_responses=True,
@@ -43,6 +41,7 @@ def create_redis_client(settings: RedisSettings) -> Redis:
         socket_timeout=settings.socket_timeout_seconds,
         health_check_interval=30,
     )
+    return client
 
 
 async def ping_redis(client: Redis) -> None:

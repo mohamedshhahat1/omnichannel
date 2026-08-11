@@ -19,7 +19,9 @@ def _required_url(name: str) -> str:
 async def postgres_engine() -> AsyncIterator[AsyncEngine]:
     url = _required_url("OC_TEST_DATABASE_URL")
     if not url.startswith("postgresql+asyncpg://"):
-        pytest.fail("OC_TEST_DATABASE_URL must use real PostgreSQL via asyncpg; SQLite is forbidden")
+        pytest.fail(
+            "OC_TEST_DATABASE_URL must use real PostgreSQL via asyncpg; SQLite is forbidden"
+        )
     engine = create_async_engine(url, pool_pre_ping=True)
     try:
         yield engine

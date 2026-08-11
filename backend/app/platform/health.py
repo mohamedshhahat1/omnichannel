@@ -43,7 +43,7 @@ CheckCallable = Callable[[], Awaitable[None]]
 class HealthStatus(StrEnum):
     """Outcome of a single check or of the aggregate report."""
 
-    PASS = "pass"
+    PASS = "pass"  # noqa: S105 - health status literal, not a credential
     FAIL = "fail"
 
 
@@ -127,7 +127,7 @@ async def _run_check(check: HealthCheck) -> CheckOutcome:
             "health.check.timeout",
             extra={"check_name": check.name, "timeout_seconds": check.timeout_seconds},
         )
-    except Exception as exc:  # noqa: BLE001 - a failing check must not crash readiness
+    except Exception as exc:  # a failing check must not crash readiness
         status = HealthStatus.FAIL
         detail = type(exc).__name__
         logger.warning(

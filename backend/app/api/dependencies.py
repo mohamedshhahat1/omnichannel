@@ -12,6 +12,7 @@ its own health registry and nothing leaks between them.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Annotated
 
@@ -75,7 +76,7 @@ def provide_session_factory(request: Request) -> async_sessionmaker[AsyncSession
 
 async def provide_database_session(
     factory: Annotated[async_sessionmaker[AsyncSession], Depends(provide_session_factory)],
-) -> AsyncSession:
+) -> AsyncIterator[AsyncSession]:
     """Yield a request-scoped async session."""
     async with factory() as session:
         yield session

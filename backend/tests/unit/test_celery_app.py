@@ -1,6 +1,7 @@
 """Celery has the approved queues and no default result backend."""
 
 import pytest
+from celery.utils.threads import LocalStack
 
 from app.core.celery_app import ContextTask, create_celery_app
 from app.core.settings import Environment, Settings
@@ -35,6 +36,9 @@ def test_delivery_safety_settings_are_enabled() -> None:
 
 def test_context_task_rejects_missing_headers() -> None:
     task = ContextTask()
-    task.run = lambda: None  # type: ignore[method-assign]
+    task.run = lambda: None
+    # A directly instantiated task is not bound to an app, so give it an empty
+    # request stack: `self.request` then falls back to a headerless Context.
+    task.request_stack = LocalStack()
     with pytest.raises(ValueError, match="tenant_id"):
         task()

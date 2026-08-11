@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import Iterator, Mapping
 
 from app.platform.correlation import sanitize_external_id
 
@@ -54,7 +54,9 @@ def task_context_from_headers(headers: Mapping[str, object]) -> TaskContext:
 
 
 def bind_task_context(context: TaskContext) -> TaskContextTokens:
-    return TaskContextTokens(_tenant_id.set(context.tenant_id), _traceparent.set(context.traceparent))
+    return TaskContextTokens(
+        _tenant_id.set(context.tenant_id), _traceparent.set(context.traceparent)
+    )
 
 
 def reset_task_context(tokens: TaskContextTokens) -> None:

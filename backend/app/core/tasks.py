@@ -7,7 +7,9 @@ from celery import shared_task
 from app.platform.task_context import current_tenant_id
 
 
-@shared_task(
+# celery ships no type stubs, so shared_task is untyped under --strict (see
+# the mypy overrides in pyproject).
+@shared_task(  # type: ignore[misc]
     name="app.core.tasks.infrastructure_smoke",
     autoretry_for=(RuntimeError,),
     retry_backoff=True,

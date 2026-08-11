@@ -9,7 +9,9 @@ MIGRATION = ROOT / "alembic" / "versions" / "20260811_0000_0001_initial_infrastr
 
 
 def test_alembic_ini_parses_and_has_no_real_dsn() -> None:
-    parser = ConfigParser()
+    # Alembic's own %(here)s interpolation is not configparser-compatible, so
+    # the file must be read with configparser interpolation disabled.
+    parser = ConfigParser(interpolation=None)
     parser.read(ROOT / "alembic.ini")
     assert parser["alembic"]["script_location"] == "%(here)s/alembic"
     assert parser["alembic"]["sqlalchemy.url"] == "driver://unused"

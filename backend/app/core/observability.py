@@ -161,7 +161,8 @@ def shutdown_tracing(provider: TracerProvider | None) -> None:
     if provider is None:
         return
     try:
-        provider.shutdown()
+        # OpenTelemetry ships partial type information; shutdown() is untyped.
+        provider.shutdown()  # type: ignore[no-untyped-call]
     except Exception:
         logger.exception("observability.tracing.shutdown_failed")
     else:
