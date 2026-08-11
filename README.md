@@ -2,8 +2,8 @@
 
 Multi-tenant SaaS platform for AI-powered omnichannel customer conversations across WhatsApp, Instagram DM, Facebook Messenger, and Instagram/Facebook comments.
 
-> **Current phase: 1 — Repository & application foundation (complete).**
-> The `backend/` FastAPI foundation exists: configuration, logging, correlation, error handling, health checks, tracing bootstrap and security headers. There is no database, queue, authentication or business functionality yet — those begin in Phase 2, which should not be started until it is explicitly approved.
+> **Current phase: 2 — Infrastructure foundation.**
+> The `backend/` FastAPI foundation now includes configuration, logging, correlation, error handling, health checks, tracing bootstrap, PostgreSQL/Redis/Celery infrastructure, Alembic, Docker/Compose, and Phase 2 pytest coverage. There is still no authentication, RBAC, business functionality, or ORM domain models yet.
 
 ## Read this first
 
@@ -21,13 +21,20 @@ This repository's documentation is the persistent source of truth for both human
 
 | Path | Purpose |
 |---|---|
-| [backend/](backend/) | FastAPI application. See [backend/README.md](backend/README.md) for setup, running it locally, configuration and the quality gates. |
+| [backend/](backend/) | FastAPI application and Phase 2 infrastructure foundation. |
 
 ```bash
 cd backend
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 uvicorn app.main:app --reload
+```
+
+For a production-shaped local stack, use Docker Compose:
+
+```bash
+cp backend/.env.example backend/.env
+docker compose up --build
 ```
 
 ## Architecture documentation
@@ -45,6 +52,17 @@ uvicorn app.main:app --reload
 | [docs/integrations.md](docs/integrations.md) | External provider contracts and abstractions |
 | [docs/operations.md](docs/operations.md) | Runbooks, backup/DR, incident response |
 
+## Phase 2 foundation now present
+
+- Async SQLAlchemy 2.x + asyncpg engine, session lifecycle, and naming conventions
+- Async Alembic environment with one initial extension-only migration
+- Async Redis client and tenant-safe key namespace `oc:{env}:t:{tenant_id}:...`
+- Celery app with Redis broker, `critical`, `default`, and `background` queues
+- Worker entrypoint and infrastructure smoke task with tenant/correlation/trace propagation
+- Dockerfile, Compose stack, PostgreSQL role bootstrap, and Makefile targets
+- `/health/live` remains dependency-free; `/health/ready` checks PostgreSQL and Redis with bounded timeouts
+- Unit tests plus opt-in real PostgreSQL/Redis integration tests; SQLite is never used
+
 ## Core architectural commitments
 
 - Modular monolith — not microservices
@@ -56,3 +74,7 @@ uvicorn app.main:app --reload
 - The LLM never touches the database; it acts only through validated, tenant-scoped, audited tools
 - OpenTelemetry for tracing/correlation, Prometheus/Grafana for metrics, Sentry for errors
 - No Kubernetes, Kafka, Elasticsearch, or service mesh without a documented trigger
+
+## Dependency lock caveat
+
+`backend/requirements.lock` is intentionally a temporary, offline-authored direct pin set because the authoring sandbox had no resolver/network access. It is **not** a fully resolved production lock and must be regenerated and validated in a networked environment before reproducible builds are claimed.
