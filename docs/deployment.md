@@ -1,6 +1,6 @@
 # Deployment
 
-> Local development, CI/CD and production topology. **Nothing is implemented yet** — no Dockerfiles, no Compose files, no workflows. This is the target design.
+> Local development, CI/CD and production topology. **Phase 2 implements the local infrastructure foundation** — Dockerfile, Compose services for API/PostgreSQL/Redis/worker/beat/migrate, a one-shot Alembic migration container, and a non-root runtime image. CI/CD workflows are still future work.
 
 ---
 
@@ -35,6 +35,8 @@ Minimum services only — do not force engineers to run infrastructure they do n
 
 Developer workflow: `docker compose up` → run migrations → seed → develop. Provider webhooks are exercised locally with a tunnel or with recorded fixture replay. A `Makefile` (or `just`) wraps the common commands so the workflow is one line each.
 
+**Implemented in Phase 2:** the committed `docker-compose.yml` starts `postgres`, `redis`, `migrate`, `api`, `worker`, and exactly one `beat` service. The migration container must finish successfully before API and worker processes start. The worker listens on `critical`, `default`, and `background` queues.
+
 ---
 
 ## 3. Container design
@@ -44,6 +46,8 @@ Developer workflow: `docker compose up` → run migrations → seed → develop.
 - **Non-root user**, read-only root filesystem where possible, dropped capabilities, no Docker socket.
 - Health checks defined per container; resource limits (CPU, memory) always set.
 - Images are tagged with the immutable commit SHA — never deployed by `latest`.
+
+**Implemented in Phase 2:** `backend/Dockerfile` builds a multi-stage Python image, installs dependencies into a virtual environment, copies the application as a non-root user, and exposes port 8000 with a liveness healthcheck.
 
 ---
 
@@ -142,6 +146,8 @@ At launch a few seconds of downtime during deploy is acceptable and should be st
 ## 9. Secrets in deployment
 
 Secrets are injected as environment variables from a protected `.env` (0600, root-owned) or from a secret manager. They are never baked into images, never committed, and never printed in deploy logs. Rotation procedures live in `operations.md`.
+
+**Phase 2 note:** `backend/.env.example` contains only local-development example values. The committed PostgreSQL role bootstrap file is local-only and must not be copied to production credential management.
 
 ---
 
