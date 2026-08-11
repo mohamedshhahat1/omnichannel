@@ -80,7 +80,7 @@ Delivered in `backend/` and the repository root:
 
 One new decision was recorded: **ADR-0014 — Async infrastructure foundation**.
 
-### Phase 14 — CI/CD Foundation 🚧
+### CI/CD Foundation 🚧
 
 A baseline GitHub Actions workflow is present (`.github/workflows/ci.yml`). It runs Ruff, MyPy, Pytest (including integration tests with Postgres/Redis), and a Docker build check on every PR and push to `main` or `phase-2-infrastructure`.
 
@@ -90,7 +90,7 @@ A baseline GitHub Actions workflow is present (`.github/workflows/ci.yml`). It r
 
 ## 3. Current phase
 
-**Phase 14 (Partial) — CI Foundation complete. Awaiting explicit approval to begin Phase 3.**
+**CI Foundation complete. Awaiting explicit approval to begin Phase 3.**
 
 ---
 
