@@ -1,0 +1,15 @@
+\set ON_ERROR_STOP on
+
+-- Local-development bootstrap only. Production credentials are provisioned externally.
+CREATE ROLE oc_app LOGIN PASSWORD 'oc_app_password'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+CREATE ROLE oc_migrator LOGIN PASSWORD 'oc_migrator_password'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+
+GRANT CONNECT ON DATABASE omnichannel TO oc_app, oc_migrator;
+GRANT USAGE, CREATE ON SCHEMA public TO oc_migrator;
+GRANT USAGE ON SCHEMA public TO oc_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE oc_migrator IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO oc_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE oc_migrator IN SCHEMA public
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO oc_app;
