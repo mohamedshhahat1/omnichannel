@@ -1,6 +1,8 @@
 # Observability
 
 > **OpenTelemetry** is the tracing and correlation standard (ADR-0010). **Prometheus + Grafana** own metrics. **Sentry** owns error tracking. Logs are structured JSON.
+>
+> **Phase 2 status:** the repository now implements the OpenTelemetry bootstrap, FastAPI instrumentation, optional SQLAlchemy and Redis instrumentation hooks, request/task correlation propagation, and bounded PostgreSQL/Redis readiness checks. Prometheus, Grafana, Sentry wiring, and alert delivery remain future work.
 
 ---
 
@@ -136,12 +138,11 @@ Separate projects (or tags) for API, workers and crawler. Every event is tagged 
 
 | Endpoint | Semantics |
 |---|---|
-| `/healthz` (liveness) | Process is alive; no dependency checks; never fails on a dependency outage |
-| `/readyz` (readiness) | PostgreSQL reachable, Redis reachable, migrations at head — removes the instance from rotation when false |
-| `/startupz` | Startup completion for slow boots |
+| `/health/live` | Process is alive; no dependency checks; never fails on a dependency outage |
+| `/health/ready` | Returns 503 before startup; after startup checks PostgreSQL and Redis with bounded per-check timeouts |
 | `/metrics` | Prometheus scrape; not publicly exposed |
 
-Workers expose their own liveness (heartbeat freshness) and readiness (broker reachable).
+Workers expose their own liveness (heartbeat freshness) and readiness (broker reachable). The readiness payload exposes only safe dependency status (`pass`, `fail`, `timeout`, or exception type), never raw exception messages, DSNs, or credentials.
 
 ---
 
@@ -174,8 +175,8 @@ Every alert must name an owner and link to a runbook in `operations.md`. Alerts 
 
 | Concern | CURRENT | FUTURE | TRIGGER |
 |---|---|---|---|
-| Trace backend | OTLP → collector → Sentry performance | Tempo/Jaeger or managed APM | Trace volume or retention needs |
+| Trace backend | OTel bootstrap plus local exporter selection | Tempo/Jaeger or managed APM | Trace volume or retention needs |
 | Log aggregation | Docker logs + `docker compose logs`/journald | Loki or a managed log platform | Multi-host deployment or search pain |
-| Metrics | Self-hosted Prometheus | Remote-write / managed, longer retention | Retention or HA requirements |
+| Metrics | Self-hosted Prometheus later | Remote-write / managed, longer retention | Retention or HA requirements |
 | Profiling | None | Continuous profiling | Unexplained CPU cost |
 | SLOs | Informal targets | Error budgets and burn-rate alerts | Paying customers with contractual SLAs |
