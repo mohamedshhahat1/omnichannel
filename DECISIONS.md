@@ -19,6 +19,7 @@ Statuses: `Proposed` · `Accepted` · `Superseded` · `Deprecated`.
 | [ADR-0011](#adr-0011--consolidated-module-boundaries-conceptual-vs-physical) | Consolidated module boundaries (conceptual vs physical) | Accepted |
 | [ADR-0012](#adr-0012--website-crawler-as-an-isolated-untrusted-workload) | Website crawler as an isolated untrusted workload | Accepted |
 | [ADR-0013](#adr-0013--standard-api-error-envelope-and-error-taxonomy) | Standard API error envelope and error taxonomy | Accepted |
+| [ADR-0014](#adr-0014--async-infrastructure-foundation) | Async infrastructure foundation | Accepted |
 
 ---
 
@@ -428,7 +429,7 @@ The crawler is a separate physical module executed by dedicated, network-restric
 1. Blocks request threads, offers no resource isolation, and puts an SSRF primitive inside the trusted API process.
 2. Ordinary workers can reach the database, Redis and internal endpoints — exactly what an SSRF payload wants.
 3. A managed service is a legitimate future option but adds cost and a data-sharing question; it does not remove the need for URL validation.
-4. Application-level validation alone is bypassable through TOCTOU and rebinding races; defence in depth requires network-level egress control.
+4. Application-level URL validation alone is bypassable through TOCTOU and rebinding races; defence in depth requires network-level egress control.
 
 ### Consequences
 - Extra deployment complexity: a separate worker container, network policy and resource limits.
@@ -507,3 +508,49 @@ Four supporting rules:
 
 ### Future migration path
 If a partner integration ever requires RFC 7807, add a content-negotiated renderer at the single `_json_error` choke point; no call site changes. If per-field client-side validation messages are needed, extend `details.fields` — it is already a list of structured entries. Localisation would key off `code`, which is precisely why `code` and `message` are separate.
+
+---
+
+## ADR-0014 — Async infrastructure foundation
+
+**Status:** Accepted · 2026-08-11 · *(introduced during Phase 2 implementation)*
+
+### Context
+Phase 2 had to add the infrastructure foundation without introducing business domains: PostgreSQL, SQLAlchemy 2.x async/asyncpg, Alembic, Redis, Celery, Docker/Compose, lifecycle wiring, and health checks. The stack had to remain honest about durability, preserve tenant isolation rules across non-SQL surfaces, and fit a small team's operational budget.
+
+### Decision
+1. **Database runtime:** use SQLAlchemy 2.x in async mode with `asyncpg`, one bounded engine per process, one async session factory per process, UTC/timeouts in server settings, and deterministic metadata naming conventions. Phase 2 adds no ORM models or domain tables.
+2. **Migration runtime:** use async Alembic configured from validated settings. Application DML credentials and migration DDL credentials are separate. The initial migration enables only `pgcrypto`, `pg_stat_statements`, `pg_trgm`, and `vector`.
+3. **Redis runtime:** use the async redis-py client and enforce tenant-safe key construction as `oc:{env}:t:{tenant_id}:{purpose}:...`; unsafe key segments are rejected.
+4. **Task execution:** use Celery with Redis as broker, exactly three foundation queues (`critical`, `default`, `background`), and no default result backend because durable business state belongs in PostgreSQL, not Redis.
+5. **Context propagation:** every task carries trusted `tenant_id`, `correlation_id`, and optional W3C `traceparent` in task headers. Context is bound with context variables for one invocation and reset reliably; no mutable global tenant state is allowed.
+6. **Application lifecycle:** the FastAPI lifespan owns PostgreSQL and Redis resources and registers readiness checks there; `/health/live` remains dependency-free while `/health/ready` checks PostgreSQL and Redis only after startup and with bounded per-check timeouts.
+7. **Local topology:** use a non-root multi-stage backend image and Docker Compose services for PostgreSQL, Redis, one-shot migrations, API, worker, and exactly one beat process. Dependency ordering uses health/completion conditions, never `service_started`.
+8. **Testing posture:** ship actual pytest unit tests plus opt-in real PostgreSQL/Redis integration tests; SQLite is forbidden for Phase 2 infrastructure coverage.
+9. **Dependency lock honesty:** if the authoring environment cannot resolve dependencies, commit only an explicitly temporary offline-authored direct pin artifact and document its limitation rather than fabricating hashes or transitive claims.
+
+### Alternatives
+1. Synchronous SQLAlchemy + psycopg.
+2. SQLite-backed infrastructure tests.
+3. Redis as a durable task/result store.
+4. Global process-level tenant/task context.
+5. A shared database role for runtime and migrations.
+6. RabbitMQ, Temporal, Kubernetes, or microservices at Phase 2.
+
+### Rejection rationale
+1. The API and long-lived connections are async already; adding a synchronous ORM path complicates the stack and risks blocking.
+2. SQLite cannot validate PostgreSQL extensions, async driver behavior, transaction semantics, or deployment-shape readiness checks.
+3. ADR-0003 makes PostgreSQL the durability boundary; using Redis for durable workflow state would weaken that guarantee.
+4. Global mutable task context risks cross-tenant leaks across concurrent work.
+5. A shared role violates least privilege and makes destructive mistakes easier.
+6. None of those technologies solve a present problem that justifies their operational cost.
+
+### Consequences
+- The repository now has a production-shaped local infrastructure baseline with clear extension points but still no domain data model.
+- Readiness reflects actual dependencies without compromising liveness semantics.
+- Redis remains disposable; Celery tasks must still be idempotent.
+- The committed `requirements.lock` cannot be presented as a validated fully resolved production lock until regenerated in a networked environment.
+- CI/CD, backup automation, and the transactional outbox schema itself remain later phases.
+
+### Future migration path
+When measured need exists: add PgBouncer for connection pressure, managed PostgreSQL/Redis for operational burden, dedicated worker pools by queue for backlog isolation, and a result backend only for a documented consumer and retention policy. Preserve the same settings and service interfaces so that operational evolution does not require an application rewrite.
