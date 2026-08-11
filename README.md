@@ -2,8 +2,8 @@
 
 Multi-tenant SaaS platform for AI-powered omnichannel customer conversations across WhatsApp, Instagram DM, Facebook Messenger, and Instagram/Facebook comments.
 
-> **Current phase: 0 — Architecture & documentation.**
-> No application source code exists yet, and none should be added until Phase 1 is explicitly started.
+> **Current phase: 1 — Repository & application foundation (complete).**
+> The `backend/` FastAPI foundation exists: configuration, logging, correlation, error handling, health checks, tracing bootstrap and security headers. There is no database, queue, authentication or business functionality yet — those begin in Phase 2, which should not be started until it is explicitly approved.
 
 ## Read this first
 
@@ -16,6 +16,19 @@ This repository's documentation is the persistent source of truth for both human
 | 3 | [ENGINEERING.md](ENGINEERING.md) | Non-negotiable engineering rules |
 | 4 | [DECISIONS.md](DECISIONS.md) | Architecture Decision Records (ADRs) |
 | 5 | [TODO.md](TODO.md) | Prioritised backlog |
+
+## Code
+
+| Path | Purpose |
+|---|---|
+| [backend/](backend/) | FastAPI application. See [backend/README.md](backend/README.md) for setup, running it locally, configuration and the quality gates. |
+
+```bash
+cd backend
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+uvicorn app.main:app --reload
+```
 
 ## Architecture documentation
 

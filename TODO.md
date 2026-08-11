@@ -2,11 +2,15 @@
 
 Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **P1** = required before real production traffic · **P2** = valuable, scheduled later.
 
-> Phase 0 (architecture + documentation) is complete. Do not start Phase 1 without explicit approval.
+> Phase 0 (architecture + documentation) and Phase 1 (application foundation) are complete. Do not start Phase 2 without explicit approval.
 
 ---
 
 ## P0 — Blocking
+
+### Verify the Phase 1 foundation locally
+- [ ] Run `pytest`, `ruff check .`, `ruff format --check .` and `mypy` in `backend/` on a machine with network access, and fix any findings
+  - The Phase 1 code was authored offline with no package index available. Compilation, `pyproject.toml` parsing and the pure-logic tests were verified; the four gates themselves were not executed. See CURRENT_STATE section 7.
 
 ### Decisions needed from the product owner
 - [ ] Choose the first channel to launch (WhatsApp / Instagram DM / Messenger / comments)
@@ -16,14 +20,27 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 - [ ] Choose the production host and the S3-compatible storage provider
 - [ ] Confirm the frontend approach for the dashboard (affects CORS/cookie configuration)
 
-### Phase 1 readiness (do not start until approved)
-- [ ] `backend/` project skeleton and `pyproject.toml`
-- [ ] FastAPI application shell with health / readiness / liveness endpoints
-- [ ] Validated settings/config layer with environment separation
-- [ ] Structured JSON logging with request and correlation IDs
-- [ ] OpenTelemetry SDK bootstrap and context propagation helpers
-- [ ] Error taxonomy and central exception handling
-- [ ] Ruff + MyPy + Pytest configured and green
+### Phase 2 readiness (do not start until approved)
+- [ ] Dependency lock file so installs are reproducible across machines and CI (`uv.lock`, or `pip-compile` output committed as `requirements.lock`)
+- [ ] Dockerfile for API and worker: multi-stage, non-root user, minimal base, no build toolchain in the runtime layer
+- [ ] Docker Compose for local development (API, PostgreSQL, Redis, worker, beat)
+- [ ] SQLAlchemy 2.x async engine, session lifecycle, declarative `Base`, constraint naming convention
+- [ ] Alembic configuration and the expand → migrate → contract workflow
+- [ ] Redis connection management and key namespacing (`oc:{env}:t:{tenant_id}:...`)
+- [ ] Celery application, queue routing, beat schedule, task base class carrying `tenant_id` / `correlation_id` / `traceparent`
+- [ ] Register PostgreSQL and Redis checks into the existing `HealthRegistry` from the application lifespan — do not modify the readiness endpoint
+- [ ] Extend `Settings` with `database`, `redis` and `celery` sections following the existing pattern
+
+### Completed in Phase 1 ✅
+- [x] `backend/` project skeleton and `pyproject.toml`
+- [x] FastAPI application factory with lifespan and `/api/v1` router foundation
+- [x] Liveness and readiness endpoints backed by an extensible health registry
+- [x] Validated, typed settings layer with development/test/production separation and production hardening
+- [x] Structured JSON logging with request and correlation IDs and credential redaction
+- [x] OpenTelemetry SDK bootstrap, FastAPI instrumentation, configurable exporter, clean shutdown
+- [x] Error taxonomy and central exception handling (ADR-0013)
+- [x] Foundational HTTP security: security headers, CORS, trusted hosts, request body limit
+- [x] Ruff + MyPy + Pytest configured; 100 hermetic tests written
 
 ---
 
@@ -43,9 +60,6 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 - [ ] Upload validation: size, content type, extension, storage location
 
 ### Infrastructure
-- [ ] Docker images for API and worker (non-root, minimal base)
-- [ ] Docker Compose for local development (API, PostgreSQL, Redis, worker, beat)
-- [ ] Alembic setup and migration workflow
 - [ ] NGINX configuration with TLS and security headers
 - [ ] Production Compose with restart policies, health checks and resource limits
 - [ ] Encrypted off-server backups + WAL archiving (PITR)
@@ -105,3 +119,6 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 | Single-server production | Cost and operational simplicity | CPU saturation, queue backlog, or zero-downtime deploys required |
 | `handoff` as a sub-package | Avoids premature module fragmentation | Routing, SLAs or skills-based assignment appear |
 | Sentry as the initial trace sink | Avoids running a trace backend early | Trace volume or retention needs justify Tempo/Jaeger |
+| No dependency lock file | Phase 1 has no reproducible-build requirement yet | Phase 2, before Docker images are built |
+| Quality gates run manually, not in CI | CI is Phase 14; running them locally is cheap | Phase 14, or earlier if a regression slips through |
+| `app/platform` and `app/core/logging.py` shadow stdlib module names | Safe under Python 3 absolute imports; names match the approved architecture | Only if a dependency performs implicit relative imports |
