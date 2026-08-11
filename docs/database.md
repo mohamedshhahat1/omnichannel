@@ -1,6 +1,6 @@
 # Database
 
-> Conceptual data model and database engineering policy. **No models or migrations exist yet** — field lists below are design intent, not implementation.
+> Conceptual data model and database engineering policy. **Phase 2 implements only the infrastructure foundation** — async SQLAlchemy/asyncpg runtime, async Alembic configuration, and one extension-only migration. No domain models or business tables exist yet.
 
 ---
 
@@ -9,6 +9,8 @@
 One PostgreSQL database, one shared schema, `tenant_id` on every tenant-owned row (ADR-0002). Isolation is enforced in the application layer through tenant-scoped repositories fed by a trusted `TenantContext`. PostgreSQL RLS is a planned defence-in-depth layer, not the primary mechanism.
 
 Required extensions: `pgcrypto` (or application-side UUIDv7), `pg_stat_statements`, `pg_trgm` (fuzzy/product search), `vector` (pgvector).
+
+**Implemented in Phase 2:** the initial Alembic migration enables exactly those four extensions and nothing else. The application uses SQLAlchemy 2.x in async mode via `asyncpg`, with bounded pools, UTC/timeouts, and deterministic metadata naming conventions.
 
 ---
 
@@ -49,7 +51,7 @@ Class D exists so that an unverifiable or unmapped provider delivery can still b
 | `sessions` | A | user_id, token_hash (unique), issued_at, last_seen_at, idle_expires_at, absolute_expires_at, revoked_at, ip, user_agent |
 | `api_keys` | B | tenant_id, key_id (unique), secret_hash, scopes, created_by, last_used_at, revoked_at, expires_at |
 | `email_tokens` | A | user_id, purpose (verify/reset), token_hash, expires_at, consumed_at |
-| `tenants` | A* | name, slug (unique), status, timezone, settings | 
+| `tenants` | A* | name, slug (unique), status, timezone, settings |
 | `memberships` | C | user_id, tenant_id, status, invited_by — unique `(user_id, tenant_id)` |
 | `roles` | A/B | name, tenant_id nullable (null = system role) |
 | `permissions` | A | code (unique), description |
@@ -170,6 +172,7 @@ Details in `billing.md`.
 5. Lock-avoidance: `CREATE INDEX CONCURRENTLY`, `ADD CONSTRAINT ... NOT VALID` then `VALIDATE`, batched backfills with a statement timeout.
 6. Every destructive migration ships with: a written plan, a fresh verified backup, a rehearsal against a production-like dataset, and a rollback/recovery note.
 7. CI runs the full upgrade path; production deploy runs migrations before the new image serves traffic, and blocks on failure.
+8. **Implemented in Phase 2:** the Alembic environment is async, reads the separate migration DSN from validated settings, and the initial migration only enables required extensions. No domain tables exist yet.
 
 ---
 
