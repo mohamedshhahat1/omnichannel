@@ -1,0 +1,86 @@
+name: omnichannel
+
+x-backend-env: &backend-env
+  OC_ENVIRONMENT: development
+  OC_LOGGING__FORMAT: console
+  OC_DATABASE__URL: postgresql+asyncpg://oc_app:oc_app_password@postgres:5432/omnichannel
+  OC_DATABASE__MIGRATION_URL: postgresql+asyncpg://oc_migrator:oc_migrator_password@postgres:5432/omnichannel
+  OC_REDIS__URL: redis://redis:6379/0
+  OC_CELERY__BROKER_URL: redis://redis:6379/1
+  OC_CELERY__RESULT_BACKEND_ENABLED: "false"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: omnichannel
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: local_postgres_password
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d omnichannel"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build:
+      context: ./backend
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./backend
+    environment: *backend-env
+    ports: ["8000:8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    build:
+      context: ./backend
+    command: ["celery", "-A", "app.worker:celery_app", "worker", "-Q", "critical,default,background", "--loglevel=INFO"]
+    environment: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  beat:
+    build:
+      context: ./backend
+    command: ["celery", "-A", "app.worker:celery_app", "beat", "--loglevel=INFO"]
+    environment: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
