@@ -18,6 +18,7 @@ Statuses: `Proposed` · `Accepted` · `Superseded` · `Deprecated`.
 | [ADR-0010](#adr-0010--opentelemetry-as-the-tracing-and-correlation-standard) | OpenTelemetry as the tracing and correlation standard | Accepted |
 | [ADR-0011](#adr-0011--consolidated-module-boundaries-conceptual-vs-physical) | Consolidated module boundaries (conceptual vs physical) | Accepted |
 | [ADR-0012](#adr-0012--website-crawler-as-an-isolated-untrusted-workload) | Website crawler as an isolated untrusted workload | Accepted |
+| [ADR-0013](#adr-0013--standard-api-error-envelope-and-error-taxonomy) | Standard API error envelope and error taxonomy | Accepted |
 
 ---
 
@@ -437,3 +438,72 @@ The crawler is a separate physical module executed by dedicated, network-restric
 
 ### Future migration path
 Move crawler workers to a dedicated host or VPC with an explicit egress proxy allowlist; optionally delegate fetching to a managed extraction provider behind the same internal interface while keeping our own validation and quotas.
+
+---
+
+## ADR-0013 — Standard API error envelope and error taxonomy
+
+**Status:** Accepted · 2026-08-11 · *(introduced during Phase 1 implementation)*
+
+### Context
+Phase 1 had to answer a question every later phase inherits: what does an error look like on the wire?
+
+FastAPI's defaults are not adequate for this platform:
+
+- `HTTPException` produces `{"detail": "..."}` with no machine-readable code, so clients must string-match human prose that we will later want to reword or translate.
+- `RequestValidationError` produces a 422 body that **includes the offending input**. On a login route that reflects the submitted password back to the caller and into every proxy and CDN log along the way; on a webhook route it reflects provider payload fragments. This is a real disclosure path, not a theoretical one.
+- Unhandled exceptions leak a stack trace when `debug` is enabled — and `debug` is exactly the setting most likely to be wrong in a hurry.
+- None of the defaults carry a request identifier, so a customer saying "it failed at about 2pm" cannot be tied to a log line.
+
+Deciding this once, before any endpoint exists, is far cheaper than harmonising ten modules' error shapes in Phase 12.
+
+### Decision
+Every non-success response — from a route, a dependency, an exception handler, or middleware — uses one envelope:
+
+```json
+{
+  "error": {
+    "code": "conflict",
+    "message": "That channel is already connected.",
+    "details": { "channel": "whatsapp" },
+    "request_id": "...",
+    "correlation_id": "..."
+  }
+}
+```
+
+- `code` is a stable, lowercase, machine-readable identifier and is part of the public API contract. Clients branch on it.
+- `message` is human-readable and always safe to display.
+- `details` is optional structured context and never contains sensitive data.
+- `request_id` and `correlation_id` are read from the ambient correlation context **by the envelope builder itself**, so no call site can forget them.
+
+A closed base taxonomy covers HTTP semantics: `bad_request` (400), `unauthorized` (401), `forbidden` (403), `not_found` (404), `conflict` (409), `payload_too_large` (413), `unprocessable_entity` (422), `rate_limited` (429), `internal_error` (500), `service_unavailable` (503).
+
+Four supporting rules:
+
+1. **`internal_message` is never serialised.** Every `AppError` may carry an operator-facing `internal_message` (`"no row for tenant_id=42 conversation_id=7"`). It is logged; it never reaches the client.
+2. **Validation failures are summarised, not echoed.** Only `location`, `type` and `message` survive. `input` and `ctx` are dropped.
+3. **5xx responses use a fixed generic sentence.** The exception type, message and traceback go to the log, tagged with the request id.
+4. **Modules do not define new exception classes for HTTP purposes.** They raise a base error with a domain-specific `code` (`ConflictError(..., code="channel_already_connected")`). The taxonomy stays closed; vocabulary stays open.
+
+### Alternatives
+1. FastAPI/Starlette defaults, unchanged.
+2. RFC 7807 `application/problem+json`.
+3. Per-module error shapes, harmonised later.
+4. Always return 200 with an error field in the body (GraphQL style).
+
+### Rejection rationale
+1. Defaults have no stable codes, no request id, and — decisively — echo submitted input on validation failure. Overriding them is the whole point.
+2. RFC 7807 is a reasonable standard, but `type` as a dereferenceable URI implies documentation infrastructure we will not maintain, and `title`/`detail`/`instance` map awkwardly onto what clients actually need. The chosen envelope carries the same information in a shape that is easier to consume, and can be rendered as `problem+json` later without changing call sites.
+3. Harmonising later never happens; by Phase 12 there would be ten shapes and a breaking change to fix them.
+4. Returning 200 for failures breaks caches, proxies, retry logic, monitoring and every HTTP client's error handling. Status codes exist; use them.
+
+### Consequences
+- Clients write one error handler and branch on `code`.
+- Support has a request id on every failure, present in both the response body and the `X-Request-ID` header, and on every log line for that request.
+- `code` values become a public contract: renaming one is a breaking change and needs the same care as renaming a field.
+- A small discipline cost — raise `AppError` subclasses, not `HTTPException` — enforced by review and by the integration tests that assert nothing sensitive appears in an error body.
+- The envelope builder depends on the correlation context, so correlation middleware must remain outside the exception handlers. This is why middleware ordering is documented in `app/api/application.py`.
+
+### Future migration path
+If a partner integration ever requires RFC 7807, add a content-negotiated renderer at the single `_json_error` choke point; no call site changes. If per-field client-side validation messages are needed, extend `details.fields` — it is already a list of structured entries. Localisation would key off `code`, which is precisely why `code` and `message` are separate.
