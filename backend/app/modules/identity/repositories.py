@@ -249,6 +249,62 @@ class MembershipRepository(TenantScopedRepository):
         )
         return frozenset((await self._session.scalars(stmt)).all())
 
+    async def role_and_permission_slugs_for(
+        self,
+        membership_id: uuid.UUID,
+    ) -> tuple[frozenset[str], frozenset[str]]:
+        """Return this membership's (role slugs, permission slugs) from the database.
+
+        This is the runtime authorization query. It walks
+        `membership_roles -> roles -> role_permissions -> permissions`, which is
+        what makes the database - not a Python constant - the thing that decides
+        what a principal may do. `DEFAULT_ROLE_GRANTS` seeds those rows; nothing
+        on this path reads it.
+
+        Both sets come back from one statement so that a caller cannot observe a
+        role list and a permission list taken from different points in time.
+
+        The join through to `permissions` is an outer join: a role holding no
+        grants still contributes its slug. With an inner join such a role would
+        vanish, making "assigned but powerless" indistinguishable from "not
+        assigned".
+
+        The role predicate mirrors `RoleRepository._visible()`. A role owned by
+        another tenant contributes nothing even if a `membership_roles` row
+        somehow points at one, so a stray assignment fails closed instead of
+        leaking a foreign tenant's grants.
+        """
+        stmt = (
+            select(models.Role.slug, models.PermissionRecord.slug)
+            .select_from(models.MembershipRole)
+            .join(models.Role, models.Role.id == models.MembershipRole.role_id)
+            .join(
+                models.Membership,
+                models.Membership.id == models.MembershipRole.membership_id,
+            )
+            .outerjoin(
+                models.RolePermission,
+                models.RolePermission.role_id == models.Role.id,
+            )
+            .outerjoin(
+                models.PermissionRecord,
+                models.PermissionRecord.id == models.RolePermission.permission_id,
+            )
+            .where(
+                models.MembershipRole.membership_id == membership_id,
+                models.Membership.tenant_id == self.tenant_id,
+                models.Membership.deleted_at.is_(None),
+                or_(
+                    models.Role.tenant_id.is_(None),
+                    models.Role.tenant_id == self.tenant_id,
+                ),
+            )
+        )
+        rows = (await self._session.execute(stmt)).all()
+        roles = frozenset(str(row[0]) for row in rows if row[0] is not None)
+        permissions = frozenset(str(row[1]) for row in rows if row[1] is not None)
+        return roles, permissions
+
     async def assign_role(self, *, membership_id: uuid.UUID, role_id: uuid.UUID) -> None:
         """Attach a role to a membership. Idempotent."""
         existing = select(models.MembershipRole).where(
@@ -301,6 +357,33 @@ class RoleRepository(TenantScopedRepository):
         """Return every role this tenant may assign."""
         stmt = self._visible().order_by(models.Role.slug)
         return (await self._session.scalars(stmt)).all()
+
+    async def permission_slugs_for(self, role_id: uuid.UUID) -> frozenset[str]:
+        """Return the permission slugs a visible role grants, from the database.
+
+        Reads the same `role_permissions` rows that runtime authorization
+        resolves against, so anything reporting a role's grants reports what is
+        actually enforced. The visibility predicate is repeated here for the
+        same reason it exists on `_visible()`: a role id belonging to another
+        tenant must return nothing rather than that tenant's grants.
+        """
+        stmt = (
+            select(models.PermissionRecord.slug)
+            .select_from(models.RolePermission)
+            .join(
+                models.PermissionRecord,
+                models.PermissionRecord.id == models.RolePermission.permission_id,
+            )
+            .join(models.Role, models.Role.id == models.RolePermission.role_id)
+            .where(
+                models.RolePermission.role_id == role_id,
+                or_(
+                    models.Role.tenant_id.is_(None),
+                    models.Role.tenant_id == self.tenant_id,
+                ),
+            )
+        )
+        return frozenset((await self._session.scalars(stmt)).all())
 
 
 class SessionRepository:
