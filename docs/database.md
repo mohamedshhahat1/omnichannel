@@ -64,12 +64,14 @@ Every table below inherits `id uuid primary key` (UUIDv7, application-generated)
 | `permissions` | A | `slug` (unique), `description` |
 | `role_permissions` | C | `role_id`, `permission_id` — unique `(role_id, permission_id)` |
 | `membership_roles` | C | `membership_id`, `role_id` — unique `(membership_id, role_id)` |
-| `sessions` | A | `user_id`, `tenant_id` (nullable), `token_digest` (unique), `csrf_digest`, `session_epoch`, `issued_at`, `last_seen_at`, `idle_expires_at`, `absolute_expires_at`, `revoked_at`, `ip`, `user_agent` |
+| `sessions` | A | `user_id`, `tenant_id` (nullable), `token_digest` (unique), `csrf_digest`, `user_epoch`, `last_seen_at`, `idle_expires_at`, `absolute_expires_at`, `revoked_at`, `ip_address`, `user_agent` |
 | `api_keys` | B | `tenant_id`, `key_id` (unique), `secret_digest`, `name`, `scopes`, `created_by_id`, `last_used_at`, `revoked_at`, `expires_at` |
 | `email_tokens` | A | `user_id`, `purpose` (`email_verification`/`password_reset`), `token_digest`, `expires_at`, `consumed_at` |
-| `audit_logs` | B | `tenant_id`, `actor_type`, `actor_user_id`, `actor_api_key_id`, `action`, `outcome`, `resource_type`, `resource_id`, `context` (jsonb), `ip`, `correlation_id`, `request_id` |
+| `audit_logs` | B | `tenant_id`, `actor_user_id`, `actor_api_key_id`, `action`, `outcome`, `resource_type`, `resource_id`, `context` (jsonb), `ip_address`, `correlation_id`, `request_id` |
 
 \* `tenants` is the tenant root, so it carries `id` rather than `tenant_id`.
+
+**Two column names worth reading twice.** `users.session_epoch` and `sessions.user_epoch` are different columns on different tables, and the whole revocation mechanism is the comparison between them: a session carries the epoch its user had when the session was issued, and bumping the user's epoch invalidates every session that recorded the old value. `sessions` has no `issued_at`; the inherited `created_at` is that timestamp. `audit_logs` has no `actor_type` column — the actor kind is derived from which of `actor_user_id` / `actor_api_key_id` is populated, as described in `observability.md` §2.1.
 
 **Divergences from the original sketch, and why.**
 
@@ -98,6 +100,8 @@ Every table below inherits `id uuid primary key` (UUIDv7, application-generated)
 The unique index on `sessions.token_digest` and on `api_keys.key_id` is what makes authentication a single indexed lookup rather than a scan that hashes every stored row.
 
 **Seeded reference data.** The migration inserts the 15 permissions of `security.md` §3, the six system roles, and their grants. This is reference data that the authorisation code cannot function without, not domain data — no tenant, user or membership row is created. An integration test asserts the seeded grants match the domain table exactly, so the two cannot drift.
+
+One consequence is worth stating plainly, because the table layout suggests otherwise: **`role_permissions` is not read on the request path.** `PermissionResolver` reads a membership's role *slugs* from `membership_roles`/`roles` and expands those slugs into permissions using the in-process `DEFAULT_ROLE_GRANTS` table in `app/modules/identity/domain.py`. The seeded rows are the reviewed, migrated, queryable copy of the same matrix, held identical by the parity test. Editing `role_permissions` in the database alone therefore changes nothing at runtime. That is deliberate for a fixed catalogue of system roles; it is the thing that has to change first if tenant-defined custom roles are ever added (P2, `TODO.md`).
 
 ### 4.2 Event backbone
 
