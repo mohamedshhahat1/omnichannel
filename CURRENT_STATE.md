@@ -16,7 +16,7 @@
 | Infrastructure foundation (PostgreSQL, Redis, Celery, Alembic, Docker) | ✅ Complete (Phase 2) |
 | Business modules | ⚠️ `identity` only (Phase 3). Every other module in `app/modules/` is still unstarted |
 | Database models | ⚠️ Identity entities only (Phase 3). Conversation, channel, event, catalog and billing tables are Phase 4+ |
-| Authentication / RBAC | ✅ Complete (Phase 3), with the 2026-08-12 RBAC correction written but not yet executed — see §3 |
+| Authentication / RBAC | ✅ Complete (Phase 3). The 2026-08-12 RBAC correction is **merged into this branch** — see §3 |
 | CI/CD | ✅ GitHub Actions pipeline (Ruff lint, Ruff format, MyPy, unit + integration Pytest on real PostgreSQL/Redis, Docker build, Compose validation) |
 | Infrastructure | ⚠️ Local development topology only; no production services provisioned |
 
@@ -122,17 +122,24 @@ One new decision was recorded: **ADR-0015 — Identity, tenancy and credential h
 
 ## 3. Current phase
 
-**Phase 3 — Identity and access: implemented, documented and pushed to `phase-2-infrastructure`. Awaiting human CI verification.**
+**Phase 3 — Identity and access: implemented, documented, and merged into `phase-2-infrastructure`.**
 
-**RBAC correction (2026-08-12), on the branch `fix/rbac-database-authoritative`, not merged.** Runtime authorization now resolves effective permissions from PostgreSQL `role_permissions` rather than from the Python `DEFAULT_ROLE_GRANTS` constant. The branch contains implementation, tests and documentation changes only.
+**RBAC correction (2026-08-12) — merged.** Runtime authorization resolves effective permissions from PostgreSQL `role_permissions` rather than from the Python `DEFAULT_ROLE_GRANTS` constant. The branch `fix/rbac-database-authoritative` was **squash-merged** into `phase-2-infrastructure` on 2026-08-12. Because the merge was a squash, the branch's individual commits do not appear on this branch as separate objects; their content does, in one commit.
 
-Neither the Phase 3 commits nor the RBAC correction has been executed anywhere. The authoring environment for the correction had no shell, no Python interpreter, no PostgreSQL, no Redis and no Docker daemon, so `pytest`, `ruff`, `mypy` and Alembic could not be run against it — see §7. CI/CD was not accessed by any automated agent. Phase 4 must not begin until the operator confirms CI is green and explicitly approves.
+**Verification status — read this carefully, the distinction matters.** The operator reported the CI pipeline green for the correction branch head immediately before the merge, after four rounds of CI-surfaced fixes: MyPy typing and `204` response models, the login lockout guard, expired-key staleness, the stale Phase-1 `test_database` metadata assertion, error-envelope parity on the unknown-address path, and invited-member test setup. Those four rounds are the first time this repository's gates had ever been executed, and they found real defects, which is exactly why the earlier "written, not run" wording existed.
+
+What this file can and cannot assert:
+
+- **Recorded, not observed:** the green result is the operator's report. No automated agent has accessed GitHub Actions results, and per repository policy none may.
+- **Tree identity:** the squash commit on `phase-2-infrastructure` has the same tree as the branch head that was reported green. Its own pipeline run is the operator's to verify.
+
+Phase 4 must not begin until the operator explicitly approves.
 
 ---
 
 ## 4. Current task
 
-None in progress. The human operator runs and observes GitHub Actions, and decides whether to merge `fix/rbac-database-authoritative` into `phase-2-infrastructure`.
+None in progress. The 2026-08-12 audit merged the RBAC correction and reconciled the documentation that still described it as unmerged and unexecuted. The next decision is the operator's: confirm CI on `phase-2-infrastructure` and approve or defer Phase 4.
 
 ---
 
@@ -185,6 +192,8 @@ Identity endpoints, all under `/api/v1`:
 | POST | `/api-keys` | Mint a key; the plaintext appears only here |
 | DELETE | `/api-keys/{api_key_id}` | Revoke a key |
 
+There is deliberately **no** endpoint that accepts an invitation. See the invited-membership limitation in §7.
+
 Browser-facing writes require the double-submit CSRF header. Service clients send `Authorization: Bearer oc_{env}_{key_id}_{secret}` instead, which bypasses CSRF because it is not a cookie.
 
 Local quality commands (when the tools are available):
@@ -204,10 +213,17 @@ Integration tests are opt-in and require `OC_TEST_DATABASE_URL` (real PostgreSQL
 
 ## 7. Known issues
 
-- **Phase 3 quality gates were only partially executable in the authoring environment.** That environment has no network and no third-party packages installed, so `pytest`, `ruff check .`, `ruff format --check .`, `mypy`, `alembic` and Docker **could not be run** and must not be assumed to pass. What was executed locally: byte-compilation and AST parsing of all 33 Phase 3 files, a >100-character line scan, a trailing-whitespace and tab scan, a trailing-newline check, a relative-import (TID252) scan, a credential-literal scan, an AST-based unused-import approximation, and a tokenizer-based approximation of `ruff format`'s string-quote normalisation. Those scans caught and fixed three real defects that would otherwise have failed CI (an unused `MembershipRepository` import, and two single-quoted strings `ruff format` would rewrite). Reading the integration suite back also caught a fourth: it drove the app with a synchronous test client, which would have handed an asyncpg connection to a second event loop. The authoritative verdict for every gate is CI.
-- **The 2026-08-12 RBAC correction was authored with even less available.** That environment had no shell at all: no working tree, no `git` binary, no Python interpreter, no PostgreSQL, no Redis, no Docker. Not one check was run against it — not even byte-compilation. `pytest`, `ruff check .`, `ruff format --check .`, `mypy`, `python -m compileall` and `alembic` were all unrunnable for the same reason, and `git status` and `git diff` were replaced by reading the pushed commits back through the GitHub API. The change touches the authorization path, so it should be treated as unverified until CI says otherwise.
+- **Phase 3 quality gates were only partially executable in the authoring environment.** That environment has no network and no third-party packages installed, so `pytest`, `ruff check .`, `ruff format --check .`, `mypy`, `alembic` and Docker **could not be run** there and were not assumed to pass. What was executed locally: byte-compilation and AST parsing of all 33 Phase 3 files, a >100-character line scan, a trailing-whitespace and tab scan, a trailing-newline check, a relative-import (TID252) scan, a credential-literal scan, an AST-based unused-import approximation, and a tokenizer-based approximation of `ruff format`'s string-quote normalisation. Those scans caught and fixed three real defects that would otherwise have failed CI (an unused `MembershipRepository` import, and two single-quoted strings `ruff format` would rewrite). Reading the integration suite back also caught a fourth: it drove the app with a synchronous test client, which would have handed an asyncpg connection to a second event loop. **Status 2026-08-12:** the gates have since been executed in CI and the operator reports them green; this file records that report rather than an observation made here. The authoritative verdict for every gate remains CI, observed by the operator.
+- **The 2026-08-12 RBAC correction was authored with even less available.** That environment had no shell at all: no working tree, no `git` binary, no Python interpreter, no PostgreSQL, no Redis, no Docker. Not one check was run against it at authoring time — not even byte-compilation — and `git status` and `git diff` were replaced by reading the pushed commits back through the GitHub API. **Status 2026-08-12:** CI subsequently exercised it and surfaced four rounds of genuine defects, every one of which was fixed on the branch before the merge, and the operator reports the pipeline green. The change is therefore no longer unexercised. It remains true that no statement about it in this repository rests on a run performed by an automated agent.
 - **CI verifies all quality gates** (Ruff lint, Ruff format, MyPy, unit + integration Pytest, Docker build, Compose validation). However, the initial offline-authored `requirements.lock` is still a direct-pin set only: CI installs from it as documented, and transitive dependencies float until the lock is regenerated with a networked resolver (P0). Phase 3 added `argon2-cffi` to it under the same limitation.
 - `backend/requirements.lock` is intentionally **not** a fully resolved production lock. It is a temporary offline-authored direct dependency pin set with no fabricated hashes or transitive claims. Regenerate it in CI or another networked environment.
+- **An invited member cannot reach the tenant they were invited to.** `ProvisioningService.invite_member` creates the membership with status `invited`. Both `_select_tenant` (at login) and `_principal_for_session` (on every request) require status `active`, and **no Phase 3 endpoint performs the `invited → active` transition**. The invited person can sign in with the initial password the inviter set, but every tenant-scoped request answers `404` until someone activates the row directly in the database:
+
+  ```sql
+  UPDATE memberships SET status = 'active', accepted_at = now() WHERE id = :membership_id;
+  ```
+
+  This is the acceptance half of the deferred e-mail work (`invite_member`'s docstring, `docs/security.md` §2.6), and it is broader than "no transport": the state transition itself is missing, so even an out-of-band invitation cannot be completed through the API. `POST /members` is honest about what it does — it creates a membership — but the tenant is unusable to the invitee until activation. Recorded in `TODO.md` under P1.
 - **Identity limitations carried forward.** `email_tokens` exists and is migrated, but no delivery mechanism is wired, so e-mail verification and password reset are modelled and not yet usable. There is no per-endpoint rate limiting yet — only per-account lockout — so login is throttled per identity but not per source address. There is no MFA, no SSO and no custom roles; all three are explicitly P2. There is no API for editing roles or `role_permissions`: the rows are now runtime-authoritative but only a migration writes them.
 - Several architectural inputs remain unanswered; see the Open Questions section of `docs/architecture.md`. The most blocking are which channel launches first, whether AI replies auto-send at launch, the first AI provider/model, the initial plan matrix, and the production hosting and object storage providers.
 
@@ -225,6 +241,7 @@ Integration tests are opt-in and require `OC_TEST_DATABASE_URL` (real PostgreSQL
 | Offline-authored dependency pin set | No resolver/network access in the authoring environment | Regenerated and validated in CI or another networked environment |
 | Redis effective-permission cache introduces a staleness window | A grant edited directly in the database, outside the service layer, becomes visible after at most `session_cache_ttl_seconds` (default 60 s). Mutations made through the application invalidate the entry immediately; the alternative is a join on every authenticated request | Permission changes must take effect instantly even for out-of-band SQL, or the cache is shown to be unnecessary |
 | No API for role or `role_permissions` mutation | `role_permissions` is now runtime-authoritative, but only migration `0002_identity_access` writes it. The invalidation hook exists and is called on role assignment, so exposing an API is wiring rather than redesign | Role management is offered to tenant administrators (P1) |
+| No `invited → active` membership transition | Acceptance was deferred alongside the e-mail transport, but the deferral removed the state change as well as the delivery, so an invited member is stranded until an operator edits the row (§7). The repository work is small — a service method plus an endpoint — and independent of the transport | The e-mail delivery work is picked up, or sooner if invitations are used before then (P1) |
 | `email_tokens` modelled without a delivery path | The table and lifecycle belong with the identity schema; the transport is a separate concern | E-mail verification or password reset becomes a product requirement |
 | Login throttled per account, not per source address | Per-account lockout is the control that protects the account; per-address limiting needs the shared rate limiter that does not exist yet | The rate limiting work in P1 is picked up |
 | Plain `text` e-mail column with a lowercase CHECK rather than `citext` | Keeps the extension surface small and the constraint explicit and portable; normalisation happens in the application and is enforced by the database | Case-insensitive matching is needed somewhere the CHECK cannot cover |
