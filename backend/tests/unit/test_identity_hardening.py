@@ -129,8 +129,14 @@ def test_an_explicit_default_port_is_still_the_same_origin() -> None:
     A browser that spells out `:443` on an https page is naming the port the
     request already went to, so this has to pass - otherwise the same-origin
     escape hatch would depend on how a client chooses to render its own URL.
+
+    It is checked against the application's own host rather than an allowlisted
+    origin on purpose: `app.example.com` is in the allowlist, so it would be
+    accepted for the wrong reason (`allowlisted`) and never exercise the port
+    comparison. `testserver` is not in the allowlist, so the decision has to
+    come from the same-origin branch, which is where the port logic lives.
     """
-    decision = _evaluate(origin_header="https://app.example.com:443")
+    decision = _evaluate(origin_header="https://testserver:443", host_header="testserver")
     assert decision.allowed
     assert decision.reason == "same_origin"
 
@@ -348,10 +354,9 @@ def _settings() -> Settings:
 
 
 def _request(**headers: str) -> Request:
-    raw = [
-        (key.replace("_", "-").lower().encode(), value.encode())
-        for key, value in headers.items()
-    ]
+    raw: list[tuple[bytes, bytes]] = []
+    for key, value in headers.items():
+        raw.append((key.replace("_", "-").lower().encode(), value.encode()))
     return Request(
         {
             "type": "http",
