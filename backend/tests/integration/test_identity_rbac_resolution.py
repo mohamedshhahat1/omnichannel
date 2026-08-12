@@ -27,11 +27,10 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy.engine import CursorResult
-
 import pytest
 from redis.asyncio import Redis
 from sqlalchemy import text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.security import PasswordHashingService
@@ -41,9 +40,12 @@ from app.modules.identity.domain import (
     DEFAULT_ROLE_GRANTS,
     MembershipStatus,
     Permission,
+    Principal,
+    PrincipalKind,
     RoleSlug,
     TenantContext,
 )
+from app.modules.identity.errors import PermissionDeniedError
 from app.modules.identity.repositories import (
     MembershipRepository,
     RoleRepository,
@@ -55,8 +57,6 @@ from app.modules.identity.services.permissions import (
     EffectivePermissionCache,
     PermissionResolver,
 )
-from app.modules.identity.errors import PermissionDeniedError
-from app.modules.identity.domain import Principal, PrincipalKind
 from app.platform.clock import utcnow
 
 pytestmark = pytest.mark.integration
