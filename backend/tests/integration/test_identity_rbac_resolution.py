@@ -27,6 +27,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy.engine import CursorResult
+
 import pytest
 from redis.asyncio import Redis
 from sqlalchemy import text
@@ -174,9 +176,13 @@ def _cached_resolver(
     return PermissionResolver(memberships, cache)
 
 
-async def _revoke_grant(session: AsyncSession, role: RoleSlug, permission: Permission) -> None:
+async def _revoke_grant(
+    session: AsyncSession,
+    role: RoleSlug,
+    permission: Permission,
+) -> None:
     """Delete one role -> permission row from the system role's grants."""
-    result = await session.execute(
+    result: CursorResult[Any] = await session.execute(
         text(
             "DELETE FROM role_permissions "
             "WHERE role_id = ("
