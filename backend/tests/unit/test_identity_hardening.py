@@ -123,6 +123,18 @@ def test_a_different_port_on_the_same_host_is_not_the_same_origin() -> None:
     assert not decision.allowed
 
 
+def test_an_explicit_default_port_is_still_the_same_origin() -> None:
+    """The port rule must not break the ordinary case it exists to protect.
+
+    A browser that spells out `:443` on an https page is naming the port the
+    request already went to, so this has to pass - otherwise the same-origin
+    escape hatch would depend on how a client chooses to render its own URL.
+    """
+    decision = _evaluate(origin_header="https://app.example.com:443")
+    assert decision.allowed
+    assert decision.reason == "same_origin"
+
+
 def test_referer_is_used_when_origin_is_absent() -> None:
     decision = _evaluate(referer_header="https://app.example.com/settings/keys")
     assert decision.allowed
@@ -231,15 +243,20 @@ class _FakeRedis:
 
 
 class _BrokenRedis:
-    """A Redis that is unreachable, the way an outage looks from here."""
+    """A Redis that is unreachable, the way an outage looks from here.
 
-    async def incr(self, key: str) -> int:
+    The arguments are underscore-prefixed because this class exists only to
+    raise: it has to match the signatures the limiter calls, and it must never
+    look at what it was passed.
+    """
+
+    async def incr(self, _key: str) -> int:
         raise RedisError("connection refused")
 
-    async def expire(self, key: str, seconds: int) -> bool:
+    async def expire(self, _key: str, _seconds: int) -> bool:
         raise RedisError("connection refused")
 
-    async def ttl(self, key: str) -> int:
+    async def ttl(self, _key: str) -> int:
         raise RedisError("connection refused")
 
 
@@ -331,7 +348,10 @@ def _settings() -> Settings:
 
 
 def _request(**headers: str) -> Request:
-    raw = [(key.replace("_", "-").lower().encode(), value.encode()) for key, value in headers.items()]
+    raw = [
+        (key.replace("_", "-").lower().encode(), value.encode())
+        for key, value in headers.items()
+    ]
     return Request(
         {
             "type": "http",
@@ -433,18 +453,26 @@ def test_no_runtime_module_references_the_static_grant_table() -> None:
 
 
 class _FakeMembershipRepository:
-    """Stands in for the database with a fixed answer."""
+    """Stands in for the database with a fixed answer.
+
+    It records the membership ids it was asked about. That started as a way to
+    use an argument ruff flagged as unused, but it is the more useful shape: a
+    resolver that returned the right permissions for the *wrong* membership
+    would otherwise look identical to a correct one.
+    """
 
     def __init__(self, roles: set[str], permissions: set[str]) -> None:
         self.tenant_id = uuid.uuid4()
         self._roles = frozenset(roles)
         self._permissions = frozenset(permissions)
         self.reads = 0
+        self.requested: list[uuid.UUID] = []
 
     async def role_and_permission_slugs_for(
         self,
         membership_id: uuid.UUID,
     ) -> tuple[frozenset[str], frozenset[str]]:
+        self.requested.append(membership_id)
         self.reads += 1
         return self._roles, self._permissions
 
@@ -464,7 +492,7 @@ async def test_permissions_resolve_from_the_database_even_if_the_grant_table_exp
     resolver reports what the database says, not what Python believes.
     """
 
-    def _explode(*args: Any, **kwargs: Any) -> frozenset[Permission]:
+    def _explode(*_args: Any, **_kwargs: Any) -> frozenset[Permission]:
         raise AssertionError("runtime authorization must not call permissions_for_roles()")
 
     monkeypatch.setattr(domain, "permissions_for_roles", _explode)
@@ -478,8 +506,10 @@ async def test_permissions_resolve_from_the_database_even_if_the_grant_table_exp
         EffectivePermissionCache(None, environment="test", ttl_seconds=60),
     )
 
-    permissions = await resolver.permissions_for(uuid.uuid4())
+    membership_id = uuid.uuid4()
+    permissions = await resolver.permissions_for(membership_id)
 
     assert permissions == frozenset({Permission.CONVERSATIONS_READ})
     assert Permission.BILLING_MANAGE not in permissions
     assert repository.reads == 1
+    assert repository.requested == [membership_id]
