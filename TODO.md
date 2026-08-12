@@ -4,6 +4,8 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 
 > Phase 0 (architecture + documentation), Phase 1 (application foundation), Phase 2 (infrastructure foundation), and Phase 3 (identity and access) are complete. Phase 3 is pushed and awaiting human CI verification. Do not start Phase 4 without explicit approval.
 
+> **RBAC correction 2026-08-12.** Runtime authorization now resolves effective permissions from PostgreSQL `role_permissions` rather than from the Python `DEFAULT_ROLE_GRANTS` constant. The change lives on the branch `fix/rbac-database-authoritative` and has **not** been executed anywhere — see *Verify the RBAC correction* under P0.
+
 ---
 
 ## P0 — Blocking
@@ -18,6 +20,12 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 ### Verify Phase 3 in CI
 - [ ] Run and observe GitHub Actions for the Phase 3 commits; the authoring environment had no network and could not execute `pytest`, `ruff`, `mypy`, `alembic` or Docker, so CI is the first authoritative run of those gates
 - [ ] Confirm `alembic upgrade head` applies `0002_identity_access` cleanly on a fresh database in the `pytest-integration` job
+
+### Verify the RBAC correction
+- [ ] Run and observe CI for `fix/rbac-database-authoritative`; the authoring environment again had no shell, no Python and no database, so none of `pytest`, `ruff`, `mypy` or Alembic has been executed against this change
+- [ ] Confirm `backend/tests/integration/test_identity_rbac_resolution.py` runs with both `OC_TEST_DATABASE_URL` and `OC_TEST_REDIS_URL` set; the four caching tests skip without Redis, and skipping them would remove exactly the evidence that the cache is safe
+- [ ] Confirm the renamed `EffectivePermissionCache` resolves cleanly everywhere: the old `RoleSlugCache` name was referenced by `tests/integration/test_identity_persistence.py`, and any missed reference is an `ImportError` at collection time
+- [ ] Decide whether to merge the branch into `phase-2-infrastructure`
 
 ### Decisions needed from the product owner
 - [ ] Choose the first channel to launch (WhatsApp / Instagram DM / Messenger / comments)
@@ -46,6 +54,7 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 - [x] Cross-tenant access to a real object answered 404 rather than 403 so identifiers cannot be probed
 - [x] Audit logging with context scrubbing, asserted not to contain an attempted password
 - [x] Unit and integration tests for identity, including adversarial and negative cross-tenant cases, on real PostgreSQL
+- [x] **RBAC correction (2026-08-12):** runtime authorization resolves effective permissions from `role_permissions` in PostgreSQL; `DEFAULT_ROLE_GRANTS` is now seed/reference/test data only and is not imported by any module on the authorization path — written, not yet executed
 
 ### Completed alongside Phase 2 — CI/CD foundation ✅
 
@@ -85,13 +94,14 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 ### Security
 - [ ] Meta and Paddle webhook signature verification with replay protection
 - [x] Central authorisation checks in the service layer, with per-permission tests — delivered in Phase 3 (`app/modules/identity/services/authorization.py`); every later module must route through it rather than checking permissions in a route
-- [ ] Cross-tenant isolation test suite (database, Redis, object storage, retrieval, tools) — the database surface is covered for identity in Phase 3; Redis, object storage, retrieval and tools are still outstanding
+- [ ] Cross-tenant isolation test suite (database, Redis, object storage, retrieval, tools) — the database surface is covered for identity in Phase 3; the Redis surface is covered for the RBAC cache by the 2026-08-12 correction; object storage, retrieval and tools are still outstanding
 - [ ] Per-endpoint and per-source-address rate limiting — Phase 3 added per-account lockout only, so login is throttled per identity but not per caller
 - [ ] Reject a request that presents both a session cookie and an API key, instead of preferring the bearer key — recorded as a known deviation in `docs/security.md` §2.10, which refers to this list
 - [ ] E-mail delivery for verification and password reset; `email_tokens` is modelled and migrated but has no transport
 - [ ] Secret scanning and dependency vulnerability scanning in CI
 - [ ] Log redaction rules and PII minimisation review
 - [ ] Upload validation: size, content type, extension, storage location
+- [ ] Role and role-permission mutation APIs. The RBAC correction makes `role_permissions` runtime-authoritative, so editing a grant now changes behaviour — but nothing exposes that edit yet. `PermissionResolver.invalidate` is the hook any such endpoint must call; see `docs/security.md` §3.2
 
 ### Infrastructure
 - [ ] NGINX configuration with TLS and security headers
@@ -131,7 +141,7 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 - [ ] Order creation tool and commerce workflows
 - [ ] TOTP MFA and step-up authentication
 - [ ] SSO / OIDC / SAML and SCIM for enterprise tenants
-- [ ] Custom roles and finer-grained permissions
+- [ ] Custom roles and finer-grained permissions — the storage and resolution path now support this, since a tenant-owned role with its own `role_permissions` rows resolves at runtime with no code change; what is missing is the API to create one
 - [ ] Team inbox, SLAs, agent availability, skills-based routing
 - [ ] Commerce platform integrations (Shopify, WooCommerce)
 - [ ] Partitioning for `messages`, `webhook_events`, `outbox_events`, `usage_events`
@@ -154,8 +164,9 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 | Sentry as the initial trace sink | Avoids running a trace backend early | Trace volume or retention needs justify Tempo/Jaeger |
 | Offline-authored dependency pin set | No resolver/network in the authoring environment | Regenerated in CI or another networked environment |
 | `app/platform` and `app/core/logging.py` shadow stdlib module names | Safe under Python 3 absolute imports; names match the approved architecture | Only if a dependency performs implicit relative imports |
-| Redis role-slug cache staleness window | Avoids a role join on every authenticated request; bounded by `session_cache_ttl_seconds` (default 60 s) | Permission changes must take effect instantly |
-| Effective permissions resolved from the Python `DEFAULT_ROLE_GRANTS` table rather than by reading `role_permissions` at runtime | The grant matrix is code plus seeded migration data, not runtime-editable configuration. `PermissionResolver` reads role *slugs* from the database and expands them in process; an integration test asserts the seeded rows and the domain table match exactly, so the two cannot drift | Custom or tenant-defined roles become a requirement (P2), at which point the grant matrix has to become data |
+| Redis effective-permission cache staleness window | Avoids a role/permission join on every authenticated request. Bounded by `session_cache_ttl_seconds` (default 60 s, maximum 300 s) and invalidated explicitly on role assignment, so the window only applies to a mutation that bypasses `PermissionResolver.invalidate` | Permission changes must take effect instantly, or a mutation path is added that cannot call the invalidation hook |
+| ~~Effective permissions resolved from the Python `DEFAULT_ROLE_GRANTS` table rather than by reading `role_permissions` at runtime~~ — **corrected 2026-08-12, no longer debt** | Was accepted on the grounds that the grant matrix is code plus seeded migration data rather than runtime-editable configuration. That reasoning was wrong in one specific way: it made the `role_permissions` rows decorative, so an operator editing a grant in the database would see no change in behaviour and no error. `PermissionResolver` now walks `membership_roles → roles → role_permissions → permissions`, and `DEFAULT_ROLE_GRANTS` seeds those rows without being consulted at runtime | Closed. Custom or tenant-defined roles (P2) are now a data change rather than a code change |
 | `email_tokens` modelled without a delivery path | The table and lifecycle belong with the identity schema; transport is a separate concern | E-mail verification or password reset becomes a product requirement |
 | Login throttled per account, not per source address | Per-account lockout protects the account; per-address limiting needs the shared rate limiter that does not exist yet | The P1 rate limiting work is picked up |
 | Plain `text` e-mail column with a lowercase CHECK rather than `citext` | Smaller extension surface; the constraint is explicit and portable | Case-insensitive matching is needed where the CHECK cannot reach |
+| No role or role-permission mutation API | Grants are seeded by migration `0002_identity_access`; nothing in Phase 3 edits them at runtime. The invalidation hook exists and is called on role assignment, so adding such an API is wiring rather than redesign | Role management is exposed to tenant administrators (P1) |
