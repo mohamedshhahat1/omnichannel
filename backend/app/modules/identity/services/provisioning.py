@@ -144,7 +144,7 @@ class ProvisioningService:
                 max_length=self._settings.password_max_length,
             ),
         )
-        if self._settings.breached_password_check_enabled and is_breached(raw_password):
+        if self._settings.breach_screen_enabled and is_breached(raw_password):
             raise IdentityValidationError(
                 "That password appears in known breach data. Please choose another.",
                 details={"field": "password", "reason": "breached"},
@@ -293,15 +293,15 @@ class ProvisioningService:
         transaction, so a failure anywhere in the request leaves the membership
         exactly as it was.
         """
-        if membership.status == MembershipStatus.ACTIVE.value:
+        current = membership.status
+        if current == MembershipStatus.ACTIVE.value:
             return membership
-        if membership.status != MembershipStatus.INVITED.value:
+        if current != MembershipStatus.INVITED.value:
+            active = MembershipStatus.ACTIVE.value
+            message = f"membership {membership.id} cannot move {current} -> {active}"
             raise MembershipTransitionError(
-                details={"status": membership.status},
-                internal_message=(
-                    f"membership {membership.id} cannot move from "
-                    f"{membership.status} to {MembershipStatus.ACTIVE.value}"
-                ),
+                details={"status": current},
+                internal_message=message,
             )
         await memberships.set_status(membership, MembershipStatus.ACTIVE)
         # Nothing cached is wrong yet - the cache holds roles and permissions,
@@ -341,11 +341,8 @@ class ProvisioningService:
         memberships = MembershipRepository(self._session, TenantContext(tenant_id=tenant.id))
         membership = await memberships.get_for_user(user.id)
         if membership is None:
-            raise TenantNotFoundError(
-                internal_message=(
-                    f"user {user.id} has no membership in tenant {tenant.id} to accept"
-                ),
-            )
+            message = f"user {user.id} has no membership in tenant {tenant.id}"
+            raise TenantNotFoundError(internal_message=message)
 
         resolver = PermissionResolver(memberships, cache)
         membership = await self._transition_to_active(
@@ -378,11 +375,8 @@ class ProvisioningService:
         memberships = MembershipRepository(self._session, principal.tenant)
         membership = await memberships.get_by_id(membership_id)
         if membership is None:
-            raise MembershipNotFoundError(
-                internal_message=(
-                    f"membership {membership_id} is not in tenant {principal.tenant_id}"
-                ),
-            )
+            message = f"membership {membership_id} is not in tenant {principal.tenant_id}"
+            raise MembershipNotFoundError(internal_message=message)
         return await self._transition_to_active(memberships, membership, resolver=resolver)
 
     async def list_members(
@@ -473,19 +467,12 @@ class ProvisioningService:
         if role.slug == RoleSlug.OWNER.value:
             require_permission(principal, Permission.BILLING_MANAGE)
             if await memberships.count_active_owners(role.id) <= 1:
-                raise LastOwnerError(
-                    internal_message=(
-                        f"refusing to remove the last active owner of tenant "
-                        f"{context.tenant_id}"
-                    ),
-                )
+                message = f"refusing to remove the last active owner of {context.tenant_id}"
+                raise LastOwnerError(internal_message=message)
 
         removed = await memberships.remove_role(membership_id=membership.id, role_id=role.id)
         if not removed:
-            raise RoleNotFoundError(
-                internal_message=(
-                    f"membership {membership.id} does not hold role {role.slug}"
-                ),
-            )
+            message = f"membership {membership.id} does not hold role {role.slug}"
+            raise RoleNotFoundError(internal_message=message)
         await resolver.invalidate(membership.id)
         return membership

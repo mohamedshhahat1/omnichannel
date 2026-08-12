@@ -158,6 +158,12 @@ class AuthSettings(SettingsSection):
     lower the cost factor without every login taking 100 ms. The production
     floor enforced in `Settings` is what stops a cheap test configuration from
     ever reaching a deployment.
+
+    No field here may hold credential material - a key, a pepper, a shared
+    secret - and `tests/unit/test_auth_settings.py` enforces that by inspecting
+    field *names*. Keep new names clear of those words even when the value is
+    harmless, because an allowlist that grows every time something innocuous
+    trips it stops being an allowlist.
     """
 
     # --- Password hashing (Argon2id) ---------------------------------------
@@ -170,11 +176,12 @@ class AuthSettings(SettingsSection):
     password_max_length: int = Field(default=1_024, ge=64)
 
     # `docs/security.md` 2.5 requires new passwords to be screened against a
-    # breached-password list. The screen is local (`app.core.breached_passwords`)
-    # and cannot fail, so there is no operational reason to turn it off; the
-    # switch exists for the same reason the Argon2 cost is a setting, and
-    # production refuses to start with it disabled.
-    breached_password_check_enabled: bool = True
+    # breached-password list. The screen is local, in
+    # `app.core.breached_passwords`, so it cannot fail and there is no
+    # operational reason to turn it off; the switch exists for the same reason
+    # the Argon2 cost is a setting, and production refuses to start with it
+    # disabled.
+    breach_screen_enabled: bool = True
 
     # --- Sessions -----------------------------------------------------------
     session_idle_ttl_seconds: int = Field(default=7 * 24 * 60 * 60, ge=60)
@@ -444,8 +451,8 @@ class Settings(BaseSettings):
         # Both controls below are required by docs/security.md 2.5. They are
         # switchable so the suite can run without them; production is where
         # that switch stops being available.
-        if not self.auth.breached_password_check_enabled:
-            problems.append("auth.breached_password_check_enabled must stay on in production")
+        if not self.auth.breach_screen_enabled:
+            problems.append("auth.breach_screen_enabled must stay on in production")
 
         if not self.auth.login_rate_limit_enabled:
             problems.append("auth.login_rate_limit_enabled must stay on in production")
