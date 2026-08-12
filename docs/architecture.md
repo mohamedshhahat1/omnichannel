@@ -1,6 +1,6 @@
 # Architecture
 
-> Phase 0 document. Describes the **target** architecture. No application code exists yet.
+> Describes the **target** architecture. Phases 0–3 are implemented: the FastAPI application foundation, the PostgreSQL/Redis/Celery infrastructure foundation, and the identity module. Everything else is still design.
 > Companion documents: `database.md`, `security.md`, `ai.md`, `messaging.md`, `billing.md`, `deployment.md`, `observability.md`, `integrations.md`, `operations.md`.
 
 ---
@@ -138,14 +138,20 @@ TLS termination, HTTP/2, security headers, request size limits, coarse IP rate l
 ### 4.2 API process (FastAPI)
 Authentication, tenant-context resolution, RBAC, Pydantic validation, thin webhook ingestion, dashboard and agent APIs, health/readiness/liveness. **No heavy work**: no AI calls, no crawling, no embedding, no large provider fan-out.
 
+As of Phase 3 the first three of those are real: a request is authenticated from an opaque session cookie or a bearer API key, the tenant context is resolved server-side from an active membership, and RBAC is checked before the service acts. Argon2id hashing is the one deliberately expensive operation in the API process; it is bounded by configuration and never held inside a database transaction.
+
 ### 4.3 Worker processes (Celery)
 Same codebase, different entrypoint, queue-scoped. Consume outbox-published tasks; own AI generation, retrieval indexing, document processing, outbound delivery, billing event processing, usage aggregation, sweeps and (later) crawling.
 
 ### 4.4 Beat / scheduler
 Outbox dispatcher, stuck-event reclaim, dead-letter alerting, usage aggregation, billing reconciliation, token/session cleanup, backup verification hooks.
 
+None of these are implemented. Two are now owed to the identity module: expired-session cleanup and audit-log retention. `sessions_absolute_expires_at_idx` exists so the first can be cheap when it is written.
+
 ### 4.5 Data plane
 PostgreSQL is the system of record, including vectors. Redis carries the broker, caches, rate limits and short locks. Object storage carries all binaries with tenant-scoped keys.
+
+Phase 3 is the first consumer of that split: sessions, memberships and roles are authoritative in PostgreSQL, while Redis holds only a short-TTL role-slug cache that can be dropped at any moment without affecting correctness.
 
 ---
 
@@ -153,18 +159,25 @@ PostgreSQL is the system of record, including vectors. Redis carries the broker,
 
 **Conceptual domain** = how we reason about ownership. **Physical package** = what exists on disk. They are deliberately not one-to-one (ADR-0011).
 
-| # | Conceptual domain | Physical package | Sub-packages | Owns (tables) |
-|---|---|---|---|---|
-| 1 | Identity & Access | `identity` | `users`, `auth`, `sessions`, `apikeys`, `tenancy`, `rbac` | users, credentials, sessions, api_keys, email_tokens, tenants, memberships, roles, permissions |
-| 2 | Conversations | `messaging` | `contacts`, `conversations`, `messages`, `handoff` | contacts, conversations, messages, message_attachments, assignments, handoff_requests, conversation_summaries |
-| 3 | Channel Integration | `channels` | `registry`, `providers/whatsapp`, `providers/instagram`, `providers/messenger`, `providers/comments` | channel_integrations, channel_accounts, provider_message_map |
-| 4 | Event & Delivery Backbone | `events` | `webhooks`, `outbox`, `dispatcher`, `idempotency`, `deadletter` | webhook_events, outbox_events, processed_events, delivery_attempts |
-| 5 | AI Assistant | `ai` | `orchestration`, `context`, `tools`, `guardrails`, `providers`, `runs` | ai_agents, ai_runs, ai_tool_calls, ai_guardrail_events |
-| 6 | Knowledge (RAG) | `knowledge` | `sources`, `documents`, `pipeline`, `embeddings`, `retrieval` | knowledge_sources, documents, document_versions, document_chunks, chunk_embeddings, processing_jobs |
-| 7 | Commerce Catalog | `catalog` | `products`, `inventory`, `pricing`, `search` | products, product_variants, prices, inventory_items, categories, product_attributes, product_images |
-| 8 | Commercial | `billing` | `plans`, `subscriptions`, `entitlements`, `usage`, `providers/paddle` | plans, features, plan_features, billing_customers, subscriptions, billing_events, invoices, usage_events, usage_aggregates, entitlement_overrides |
-| 9 | Media | `media` | `storage`, `objects`, `signing` | media_objects |
-| 10 | Web Ingestion | `crawler` | `validation`, `fetch`, `extract`, `jobs` | crawl_jobs, crawl_pages |
+| # | Conceptual domain | Physical package | Sub-packages | Owns (tables) | Status |
+|---|---|---|---|---|---|
+| 1 | Identity & Access | `identity` | `services`, `api` | tenants, users, memberships, roles, permissions, role_permissions, membership_roles, sessions, api_keys, email_tokens, audit_logs | **Implemented (Phase 3)** |
+| 2 | Conversations | `messaging` | `contacts`, `conversations`, `messages`, `handoff` | contacts, conversations, messages, message_attachments, assignments, handoff_requests, conversation_summaries | Planned |
+| 3 | Channel Integration | `channels` | `registry`, `providers/whatsapp`, `providers/instagram`, `providers/messenger`, `providers/comments` | channel_integrations, channel_accounts, provider_message_map | Planned |
+| 4 | Event & Delivery Backbone | `events` | `webhooks`, `outbox`, `dispatcher`, `idempotency`, `deadletter` | webhook_events, outbox_events, processed_events, delivery_attempts | **Next (Phase 4)** |
+| 5 | AI Assistant | `ai` | `orchestration`, `context`, `tools`, `guardrails`, `providers`, `runs` | ai_agents, ai_runs, ai_tool_calls, ai_guardrail_events | Planned |
+| 6 | Knowledge (RAG) | `knowledge` | `sources`, `documents`, `pipeline`, `embeddings`, `retrieval` | knowledge_sources, documents, document_versions, document_chunks, chunk_embeddings, processing_jobs | Planned |
+| 7 | Commerce Catalog | `catalog` | `products`, `inventory`, `pricing`, `search` | products, product_variants, prices, inventory_items, categories, product_attributes, product_images | Planned |
+| 8 | Commercial | `billing` | `plans`, `subscriptions`, `entitlements`, `usage`, `providers/paddle` | plans, features, plan_features, billing_customers, subscriptions, billing_events, invoices, usage_events, usage_aggregates, entitlement_overrides | Planned |
+| 9 | Media | `media` | `storage`, `objects`, `signing` | media_objects | Planned |
+| 10 | Web Ingestion | `crawler` | `validation`, `fetch`, `extract`, `jobs` | crawl_jobs, crawl_pages | Planned |
+
+Row 1's owned-table list has been reconciled with what migration `0002_identity_access` actually creates. Two differences from the original sketch:
+
+- **There is no `credentials` table.** `password_hash` is a column on `users`. A credential with no independent lifecycle, no second row per user and no separate access pattern does not earn a table; if per-credential-type rows are ever needed (passkeys, for instance), that is an additive expand migration, not a redesign.
+- **Three join and record tables were missing** from the sketch and are listed now: `role_permissions`, `membership_roles` and `audit_logs`.
+
+The planned sub-packages (`users`, `auth`, `sessions`, `apikeys`, `tenancy`, `rbac`) were not created as directories — see §7.
 
 **Cross-cutting (not domains):**
 
@@ -172,6 +185,8 @@ PostgreSQL is the system of record, including vectors. Redis carries the broker,
 |---|---|
 | `core` | settings, database session/engine, Celery app, logging, OpenTelemetry bootstrap, error handling, security primitives (hashing, tokens, signatures) |
 | `platform` | shared kernel: `TenantContext`, `ActorContext`, pagination, ID generation, money types, audit log writer, rate limiter, clock |
+
+Phase 3 filled in parts of both: `core/security.py` holds the hashing, token-generation, digest and API-key primitives; `platform/ids.py` and `platform/clock.py` hold ID generation and the clock. Two items sit differently than planned — `TenantContext` and the audit writer live in `identity` rather than `platform`, because both depend on identity's own domain types and hoisting them would invert the dependency. The rate limiter does not exist yet.
 
 **Deliberate consolidations (from the first draft):**
 
@@ -181,6 +196,8 @@ PostgreSQL is the system of record, including vectors. Redis carries the broker,
 - `entitlements` + `usage` → sub-packages of **`billing`** — entitlements are meaningless without plans and usage.
 - `handoff` → sub-package of **`messaging`** — promote to a module if routing/SLA/skills logic grows.
 - `audit`, `notifications`, `observability` → `platform` / `core` — cross-cutting utilities, not domains.
+
+The first of those consolidations was vindicated in Phase 3: sessions reference users, memberships bridge users and tenants, roles attach to memberships, and API keys are minted against a membership's permissions. Any cut between those four would have needed an import back across it.
 
 **Why `crawler` is separate from `knowledge`:** conceptually it feeds Knowledge, but it is an untrusted, network-restricted workload with its own deployment and security boundary (ADR-0012). This is the clearest example of conceptual and physical boundaries deliberately diverging.
 
@@ -227,6 +244,8 @@ crawler    → knowledge (narrow ingestion interface only)
 
 Cycles are prohibited. If module A needs to react to something in module B, B emits an outbox event and A consumes it.
 
+`identity` sits at the root of that graph and, correctly, imports no other domain module — only `core` and `platform`. Every later module depends on it, so it must never depend on any of them. The layering inside it follows the stack above exactly: `domain.py` has no I/O and imports nothing from SQLAlchemy, services orchestrate and authorise, repositories are the only code that issues queries. That is what makes the whole module unit-testable without a database.
+
 ---
 
 ## 7. Repository structure (target)
@@ -269,6 +288,23 @@ modules/<module>/
 └─ tests/
 ```
 
+**How `identity` actually landed, and why.** It ships `api/` and `services/` as packages, but `domain`, `models` and `repositories` as single modules rather than directories:
+
+```text
+modules/identity/
+├─ api/            routes.py, schemas.py, dependencies.py
+├─ services/       authentication, sessions, api_keys, permissions,
+│                  provisioning, audit, authorization, validation
+├─ domain.py       enums, grants, Principal, TenantContext, normalisation
+├─ errors.py       domain errors over the ADR-0013 envelope
+├─ models.py       the eleven tables
+└─ repositories.py TenantScopedRepository and the global-scope repositories
+```
+
+Each of those three is one cohesive unit — the tables share a base class and foreign-key each other, the repositories share a scoping base, and the domain rules are a few hundred lines of enums and pure functions. Splitting them into packages would have produced directories containing a single file plus an `__init__.py` re-exporting it. The prescribed shape above stays the target for modules that grow past that point, and `services/` is already a package precisely because it did.
+
+What the rule is really protecting is rule 2 of §6: `models` and `repositories` are private to the module regardless of whether they are files or directories. Nothing outside `identity` imports either. `tasks/`, `events/` and `providers/` are absent because identity has no Celery task, publishes no event yet, and talks to no external provider. Tests live in the shared `tests/unit` and `tests/integration` trees rather than per-module, matching the Phase 1 layout.
+
 ---
 
 ## 8. Current → Future → Trigger
@@ -282,11 +318,13 @@ modules/<module>/
 | Redis | Self-hosted container | Managed / HA | Multi-host deployment or reliability requirement |
 | Vectors | pgvector on primary | Replica → separate PG → dedicated vector DB | Retrieval p95 SLO breach or OLTP degradation |
 | Search | SQL filters + full-text | Hybrid (BM25 + vector) rerank | Measured retrieval quality gap |
-| Tenant isolation | Application-scoped repositories | + PostgreSQL RLS | Schema stable, or compliance requirement |
+| Tenant isolation | Application-scoped repositories — **implemented in Phase 3** as `TenantScopedRepository`, so scoping is structural rather than a filter each call site must remember | + PostgreSQL RLS | Schema stable, or compliance requirement |
+| Session storage | PostgreSQL authoritative + Redis read-through cache with an epoch check — **implemented in Phase 3** | Unchanged; the cache TTL is the only tunable | Auth lookup shows up in latency profiling |
 | Outbox dispatch | Poller with `SKIP LOCKED` | + `LISTEN/NOTIFY` hint | Dispatch latency budget < 1 s |
 | Tracing | OTel → collector → Sentry | Tempo/Jaeger or managed APM | Trace volume/retention needs |
 | Crawler | Designed only | Isolated egress-restricted workers | Tenants require website ingestion |
 | Visual search | Schema headroom only | Image embeddings + similarity | Proven customer demand |
+| Rate limiting | Per-account login lockout only | Shared limiter across auth, webhooks, AI and uploads | Before any public exposure |
 
 ---
 
@@ -302,6 +340,8 @@ modules/<module>/
 | Document ingestion → RAG | `ai.md` §6 |
 | Website crawling | `ai.md` §8 |
 | Billing webhook | `billing.md` §5 |
+| Authentication and tenant resolution | `security.md` §2 |
+| Authorisation and RBAC | `security.md` §3 |
 
 ---
 
@@ -322,6 +362,8 @@ Ordered steps, each gated by a measurable trigger. Do not pre-build them.
 | 9 | Partitioning (messages, events, usage) | Table > ~100 M rows or slow retention deletes |
 | 10 | Extract a service | Independent scaling/reliability/ownership need |
 
+One Phase 3 note for step 2: sessions are server-side but stored in PostgreSQL and cached in Redis, both shared, so API replicas need no sticky sessions. Argon2id is CPU-bound by design and will show up in step 2's CPU trigger sooner than most endpoints — login cost is a deliberate purchase of resistance to offline cracking, and the correct response to that pressure is more API capacity, not cheaper hashing.
+
 ---
 
 ## 11. Performance considerations
@@ -335,6 +377,8 @@ Ordered steps, each gated by a measurable trigger. Do not pre-build them.
 - Never call an external provider inside a database transaction.
 - Bound every external call with a timeout, retry policy and circuit-breaking behaviour.
 - Track slow queries (`pg_stat_statements`) from the first production day.
+- Authentication is one indexed lookup: sessions by unique `token_digest`, API keys by unique `key_id`. Never scan and hash.
+- Password hashing is deliberately slow and belongs outside any transaction — never hash while holding a row lock.
 
 ---
 
@@ -354,7 +398,9 @@ Ordered steps, each gated by a measurable trigger. Do not pre-build them.
 12. Multiple AI agents/personas per tenant at launch?
 13. Expected message volume per tenant (capacity model input)?
 14. Are public comment replies held for approval by default?
-15. What must be visible in the audit log for launch?
+15. What must be visible in the audit log for launch? — *partially answered.* The identity half is settled and implemented: authentication outcomes, membership and role changes, and API-key lifecycle (`security.md` §10.1). The conversation, AI and billing half is still open.
+
+Question 6 acquired a dependency in Phase 3: the session and CSRF cookies use the `__Host-` prefix, which forbids a `Domain` attribute. The dashboard must therefore be served from the same origin as the API, or the cookie strategy has to be revisited before a split-origin frontend can work. This is a constraint to design around, not a defect — it is exactly the subdomain-injection protection the prefix exists to provide.
 
 ---
 
@@ -374,12 +420,17 @@ Ordered steps, each gated by a measurable trigger. Do not pre-build them.
 | 10 | Single-server failure | High | Tested restore, documented rebuild runbook, RTO < 4 h |
 | 11 | Module boundary erosion | Medium | Import rules in CI, review discipline, ADRs |
 | 12 | Malicious upload | Medium | Type/size validation, isolated storage, scanning, no execution path |
+| 13 | Credential stuffing against the login endpoint | High | Argon2id, per-account lockout; **per-address rate limiting is not yet implemented** and is required before public exposure |
+
+Risk 1's mitigation is now partly built rather than planned: `TenantScopedRepository` makes an unscoped query on a tenant-owned table difficult to express by accident, and the identity integration suite asserts the negative cases directly. That covers the SQL surface for one module; Redis, object storage, retrieval and AI tools remain to be covered as those modules land.
 
 ---
 
 ## 14. Postponed decisions
 
 Kubernetes · Kafka/event streaming · Elasticsearch/OpenSearch · dedicated vector database · microservice extraction · database/schema per tenant · RLS timing · managed PostgreSQL/Redis vendor · external IdP · MFA mechanics · enterprise SSO/SCIM · visual-search model · data warehouse/BI · workflow engine (Temporal) · multi-region · data residency · ABAC/custom roles · CDN strategy.
+
+Still postponed after Phase 3. ADR-0009 and ADR-0015 were written so that adding an external IdP, MFA or SSO later changes only how a session is **established**, never how it is **validated** — which is what keeps these three cheap to defer. Custom roles are likewise deferred but not designed out: `roles.tenant_id` is nullable precisely so a tenant-owned role can be added without a schema change.
 
 ---
 
@@ -390,10 +441,10 @@ See `CURRENT_STATE.md` for live status. Reordering rationale is recorded below t
 | Phase | Name | Key outcome |
 |---|---|---|
 | 0 ✅ | Architecture & documentation | This document set; ADR-0001–0012 |
-| 1 | Repository & application foundation | FastAPI shell, config, logging, OTel bootstrap, lint/type/test gates, health endpoints |
-| 2 | Config, Docker, PostgreSQL, Alembic, Redis, Celery | Local environment, migration workflow, worker + beat skeletons |
-| 3 | Identity | Users, auth sessions, tenants, memberships, RBAC, audit log |
-| 4 | **Event backbone** | `webhook_events`, `outbox_events`, dispatcher, `processed_events`, dead-letter, replay tooling |
+| 1 ✅ | Repository & application foundation | FastAPI shell, config, logging, OTel bootstrap, lint/type/test gates, health endpoints |
+| 2 ✅ | Config, Docker, PostgreSQL, Alembic, Redis, Celery | Local environment, migration workflow, worker + beat skeletons |
+| 3 ✅ | Identity | Users, auth sessions, tenants, memberships, RBAC, API keys, audit log; migration `0002_identity_access`; ADR-0015 |
+| 4 ◀ | **Event backbone** | `webhook_events`, `outbox_events`, dispatcher, `processed_events`, dead-letter, replay tooling |
 | 5 | Conversations | Contacts, conversations, messages, attachments, normalized model |
 | 6 | Channels & webhook ingestion | Provider abstraction, Meta adapters, signature verification, ingestion on the outbox |
 | 7 | Outbound delivery | Delivery attempts, idempotency keys, retries, rate-limit handling |
@@ -408,6 +459,8 @@ See `CURRENT_STATE.md` for live status. Reordering rationale is recorded below t
 | 16 | Visual product search | Image embeddings, tenant-scoped similarity |
 | 17 | Load & security testing, hardening | Load tests, isolation/pen tests, restore rehearsal, readiness checklist |
 
+**Phase 4 has not been started.** It is the next phase and requires explicit approval before work begins.
+
 **Why this differs from the original ordering**
 
 1. **The event backbone moved before channels (new Phase 4).** The outbox is now foundational (ADR-0003); channels, billing, AI and knowledge all publish through it. Building it after webhook ingestion would mean retrofitting reliability into live code paths.
@@ -415,3 +468,5 @@ See `CURRENT_STATE.md` for live status. Reordering rationale is recorded below t
 3. **Observability is split.** A baseline (structured logs, OTel bootstrap, health endpoints) lands in Phase 1 because retrofitting context propagation is expensive; dashboards and alerts harden in Phase 13.
 4. **Usage metering folded into Phase 12** rather than standing alone — it shares tables and lifecycle with billing and entitlements.
 5. **Crawler and visual search moved after launch readiness** — neither is launch-critical, and the crawler carries the highest security cost in the system.
+
+**Phase 3 in retrospect.** Identity landed before the event backbone, which was the right order: `audit_logs` needs an actor, and every module after this one needs a `TenantContext` to scope against. It also means the outbox arrives into a codebase where tenant scoping and authorisation already exist, so event payloads can carry a tenant id that something is prepared to verify. The one thing Phase 3 deferred that Phase 4 will want is a rate limiter — webhook endpoints need one, and it should be built as shared infrastructure rather than an events-module detail.
