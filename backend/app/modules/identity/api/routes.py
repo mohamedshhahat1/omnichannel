@@ -54,7 +54,6 @@ from app.modules.identity.domain import (
     AuditOutcome,
     Permission,
     Principal,
-    permissions_for_roles,
 )
 from app.modules.identity.repositories import (
     RoleRepository,
@@ -386,9 +385,17 @@ async def list_roles(
     session: DatabaseSessionDep,
     principal: PrincipalDep,
 ) -> RoleListResponse:
-    """List the roles the caller's tenant may assign, with their grants."""
+    """List the roles the caller's tenant may assign, with their grants.
+
+    The grants are read from `role_permissions` - the same rows the
+    authorization path resolves against - so this listing cannot advertise a
+    permission that a request would then be refused, or hide one it would be
+    allowed. Deriving them from the Python default matrix instead would let the
+    two drift the moment a grant is changed in the database.
+    """
     require_permission(principal, Permission.TENANT_READ)
-    roles = await RoleRepository(session, principal.tenant).list_visible()
+    repository = RoleRepository(session, principal.tenant)
+    roles = await repository.list_visible()
     return RoleListResponse(
         items=[
             RoleSummary(
@@ -396,9 +403,7 @@ async def list_roles(
                 name=role.name,
                 description=role.description,
                 is_system=role.is_system,
-                permissions=sorted(
-                    permission.value for permission in permissions_for_roles([role.slug])
-                ),
+                permissions=sorted(await repository.permission_slugs_for(role.id)),
             )
             for role in roles
         ]
