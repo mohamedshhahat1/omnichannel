@@ -212,6 +212,11 @@ Production settings validation additionally rejects `*` in
 `csrf_trusted_origins`, `breach_screen_enabled=false` and
 `login_rate_limit_enabled=false`.
 
+**All nine are documented in `backend/.env.example`** as of the closure audit
+(§7). They were absent from it when this table was first written, which meant
+the one setting an operator must change for a proxied deployment -
+`server.trusted_proxy_hops` - was discoverable only by reading the source.
+
 ---
 
 ## 4. Tests added
@@ -302,17 +307,26 @@ The five causes, and what was done about each:
    a `conversations.read` key, which the API correctly refuses - a key may not
    grant more access than it holds.
 
+A second run was then observed against commit `093e0b9a`. The unit gate
+improved to **1 failed, 446 passed**, and `ruff format --check` still reported
+one file. Both were faults in the new unit test file, not in application code:
+the explicit-default-port test asserted `same_origin` for an origin that is
+also in the test's allowlist, so it was matched by the allowlist branch first
+and never exercised the port comparison at all. It now uses a host that is
+deliberately not allowlisted. No integration, MyPy, Docker or Compose output
+was available for that run.
+
 No assertion was weakened, no test was deleted, and no expected value was
 changed to match observed behaviour except where the requirement itself had
-moved (item 3). Four of the five were faults in this branch's own code or
-tests; the fifth was a policy change requested deliberately.
+moved (item 3). The faults were in this branch's own code or tests; the one
+policy change was requested deliberately.
 
 **What this section still cannot claim.** The gates have not been observed
-passing. The fixes above are pushed but the resulting CI run has not been read
-by the author of this note, and `mypy`, `docker build` and `docker compose
-config` have not been seen at all. Until someone can point at a green run of
-every job on this branch's head, the correct description remains "fixed in
-response to a real failing run", not "verified".
+passing. The fixes above are pushed but no green run has been read, and `mypy`,
+`docker build` and `docker compose config` have not been seen at all, on any
+commit of this branch. Until someone can point at a green run of every job on
+this branch's head, the correct description remains "fixed in response to real
+failing runs", not "verified".
 
 No migration was added: nothing in this pass changes the schema.
 
@@ -360,21 +374,23 @@ If per-tenant custom roles ever arrive (§6.1), editing a role will need to
 invalidate every membership holding it; the current cache key layout supports
 that but no such fan-out is implemented, because no such mutation exists.
 
-### 6.5 Documentation files not amended in place
+### 6.5 Documentation amended in part
 
-See §7. The stale statements are enumerated there, but `docs/security.md`,
-`CURRENT_STATE.md`, `TODO.md` and `DECISIONS.md` were not edited by this pass.
+The closure audit amended `TODO.md` and `backend/.env.example` in place.
+`docs/security.md`, `CURRENT_STATE.md` and `DECISIONS.md` were **not** amended;
+the exact required changes remain enumerated in §7 rather than applied, because
+the tooling available replaces a file wholesale and a blind rewrite of a 36 KB
+security specification is a worse outcome than a precise list.
 
 ---
 
 ## 7. Statements elsewhere that this branch supersedes
 
-These files still describe the pre-hardening state. The tooling available to
-this pass replaces a file wholesale rather than patching it, and blind-rewriting
-a 36 KB security specification is a worse outcome than a precisely-scoped list
-of amendments. Each item below is the exact change required.
+Each item below is the exact change required. Items marked **APPLIED** were
+amended during the closure audit; the rest still describe the pre-hardening
+state.
 
-**`docs/security.md`**
+**`docs/security.md`** - outstanding
 
 1. §2.4 - the CSRF section should record that layer 3 (Origin/Referer) is now
    implemented for cookie-authenticated unsafe methods, evaluated before the
@@ -390,17 +406,31 @@ of amendments. Each item below is the exact change required.
 5. §10.1 - the audit action list should gain `membership.accept`,
    `membership.activate` and `membership.remove_role`.
 
-**`CURRENT_STATE.md`** - the membership lifecycle should be described as
-implemented in both directions into `ACTIVE`; the credential-precedence,
-origin, throttling and breach-screening rows should move to implemented, each
-qualified by §5.
+**`CURRENT_STATE.md`** - outstanding. The membership lifecycle should be
+described as implemented in both directions into `ACTIVE`; the
+credential-precedence, origin, throttling and breach-screening rows should move
+to implemented, each qualified by §5.
 
-**`TODO.md`** - the corresponding Phase 3 items are addressed on this branch;
-they should not be ticked until a green run of every job on this branch's head
-has been seen (§5).
+**`TODO.md`** - **APPLIED.** Four P1 items and three technical-debt rows
+described this branch's own code as missing: credential ambiguity, the
+`invited -> active` transition, per-source throttling and role revocation. The
+first two are now ticked; the throttling and role-mutation items remain open
+with their scope corrected to what is genuinely left (per-endpoint limiting, and
+editing a role's grants). The CI trigger claim was corrected from
+`main`/`phase-2-infrastructure` to every branch, and a dated note states that
+the work sits on an unmerged branch whose pipeline has not been observed green -
+so "implemented" is not read as "verified".
 
-**`DECISIONS.md` / ADR-0015** - the historical text must stand. The addendum to
-append, and the limit of what the repository proves:
+**`backend/.env.example`** - **APPLIED.** It documented none of the nine
+settings in §3. All nine are now present with their real defaults, and
+`OC_SERVER__TRUSTED_PROXY_HOPS` carries the warning that its safe default of
+`0` is the wrong value behind a proxy. A stale comment describing
+`SESSION_CACHE_TTL_SECONDS` as the TTL of "the Redis role-slug cache" was
+corrected: that cache holds resolved effective permissions, and the old wording
+implied something still re-derives permissions from slugs.
+
+**`DECISIONS.md` / ADR-0015** - outstanding. The historical text must stand.
+The addendum to append, and the limit of what the repository proves:
 
 > **2026-08-12 - verification note.** The Phase 3 RBAC correction described
 > above was implemented on `fix/rbac-database-authoritative` and merged into
@@ -413,21 +443,25 @@ append, and the limit of what the repository proves:
 > the merge is visible in repository history, a green pipeline is not, and it
 > should be recorded here only by someone who can point at the run.
 
-**`backend/tests/integration/test_identity_api.py`** - the docstring of
-`_activate_membership` states that the INVITED -> ACTIVE transition "has no
-endpoint until Phase 4". That is no longer true; the raw `UPDATE` remains a
-reasonable fixture shortcut, but the comment should now point at
-`POST /members/{id}/activate`.
+**`backend/tests/integration/test_identity_api.py`** - outstanding. The
+docstring of `_activate_membership` states that the INVITED -> ACTIVE transition
+"has no endpoint until Phase 4". That is no longer true; the raw `UPDATE`
+remains a reasonable fixture shortcut, but the comment should now point at
+`POST /members/{id}/activate`. Left unamended deliberately: it is a docstring
+inside a 58-test file that the available tooling can only rewrite wholesale, and
+the risk of corrupting a passing integration suite outweighs the value of
+correcting a comment.
 
 ---
 
 ## 8. Recommended before Phase 4
 
 1. Read the CI run for this branch's head and record the result here. §5
-   documents a failing run and the fixes made in response; it does not document
-   a passing one, and `mypy`, `docker build` and `docker compose config` have
-   not been observed at all.
-2. Apply the amendments in §7.
+   documents two failing runs and the fixes made in response; it does not
+   document a passing one, and `mypy`, `docker build` and `docker compose
+   config` have not been observed at all.
+2. Apply the three outstanding amendments in §7 - `docs/security.md`,
+   `CURRENT_STATE.md` and `DECISIONS.md`.
 3. Decide §6.1 explicitly - per-tenant custom roles, or a documented statement
    that role definitions are migration-managed for the foreseeable future.
    Phase 4's event work should not be built on an unstated assumption either
@@ -435,5 +469,6 @@ reasonable fixture shortcut, but the comment should now point at
 4. Configure `server.trusted_proxy_hops` for each deployed environment. Left at
    `0` behind a reverse proxy, the login limiter buckets every request under
    the proxy's address, which turns a per-source control into a global one.
+   `backend/.env.example` now says so at the point of configuration.
 5. Consider seeding `COMMON_BREACHED_PASSWORDS` from a fuller corpus at deploy
    time; the interface already accepts one.
