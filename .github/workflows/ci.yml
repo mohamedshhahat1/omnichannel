@@ -10,11 +10,12 @@
 # Opus) must not access GitHub Actions results or request CI credentials.
 name: CI
 
+# Every branch, every pull request. `branches: ["**"]` matches all branches
+# without also firing on tag pushes, which a bare `push:` would do.
 on:
   push:
     branches:
-      - main
-      - phase-2-infrastructure
+      - "**"
   pull_request:
 
 # Least privilege: read-only checkout is the only repository access needed.
