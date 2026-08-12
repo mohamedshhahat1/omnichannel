@@ -1,6 +1,8 @@
 # Database
 
-> Conceptual data model and database engineering policy. **Phase 2 implements only the infrastructure foundation** — async SQLAlchemy/asyncpg runtime, async Alembic configuration, and one extension-only migration. No domain models or business tables exist yet.
+> Conceptual data model and database engineering policy.
+>
+> **Implemented so far:** Phase 2 added the infrastructure foundation — async SQLAlchemy/asyncpg runtime, async Alembic configuration, and one extension-only migration. **Phase 3 added the eleven identity and access tables** (§4.1) in migration `0002_identity_access`. Every other section remains a conceptual model for tables that do not exist yet.
 
 ---
 
@@ -11,6 +13,8 @@ One PostgreSQL database, one shared schema, `tenant_id` on every tenant-owned ro
 Required extensions: `pgcrypto` (or application-side UUIDv7), `pg_stat_statements`, `pg_trgm` (fuzzy/product search), `vector` (pgvector).
 
 **Implemented in Phase 2:** the initial Alembic migration enables exactly those four extensions and nothing else. The application uses SQLAlchemy 2.x in async mode via `asyncpg`, with bounded pools, UTC/timeouts, and deterministic metadata naming conventions.
+
+**Phase 3 note:** application-side UUIDv7 generation is used for primary keys. `pgcrypto`'s `gen_random_uuid()` is used only inside migration `0002` to seed reference rows, because a migration cannot import application code.
 
 ---
 
@@ -27,6 +31,8 @@ Every table must be classified in one of four categories, and the classification
 
 Class D exists so that an unverifiable or unmapped provider delivery can still be recorded for debugging without being silently attributed to the wrong tenant.
 
+As of Phase 3, classes A, B and C all have real instances. Class D has none until the event backbone lands in Phase 4.
+
 ---
 
 ## 3. Conventions
@@ -39,27 +45,59 @@ Class D exists so that an unverifiable or unmapped provider delivery can still b
 - **Naming:** `snake_case`, plural tables, `<table>_<cols>_idx`, `<table>_<cols>_uq`, `fk_<table>_<ref>`.
 - **Deletion:** hard delete by default. Soft deletion only where justified (see §9).
 
+Phase 3 follows all of these: every identity primary key is a UUIDv7 generated in the application, every timestamp is `timestamptz`, and every status column is a `text` column with a `CHECK` constraint rather than a PostgreSQL enum type — so adding a status later is an `ALTER ... DROP/ADD CONSTRAINT` rather than an enum migration that locks.
+
 ---
 
 ## 4. Domain model overview
 
-### 4.1 Identity & Access
+### 4.1 Identity & Access — **implemented (Phase 3, migration `0002_identity_access`)**
 
-| Table | Class | Notable fields |
+Every table below inherits `id uuid primary key` (UUIDv7, application-generated) and `created_at timestamptz not null default now()`. Mutable tables also carry `updated_at timestamptz` maintained on update.
+
+| Table | Class | Columns beyond the base |
 |---|---|---|
-| `users` | A | email (citext, unique), password_hash (Argon2id), email_verified_at, status, last_login_at |
-| `sessions` | A | user_id, token_hash (unique), issued_at, last_seen_at, idle_expires_at, absolute_expires_at, revoked_at, ip, user_agent |
-| `api_keys` | B | tenant_id, key_id (unique), secret_hash, scopes, created_by, last_used_at, revoked_at, expires_at |
-| `email_tokens` | A | user_id, purpose (verify/reset), token_hash, expires_at, consumed_at |
-| `tenants` | A* | name, slug (unique), status, timezone, settings |
-| `memberships` | C | user_id, tenant_id, status, invited_by — unique `(user_id, tenant_id)` |
-| `roles` | A/B | name, tenant_id nullable (null = system role) |
-| `permissions` | A | code (unique), description |
-| `role_permissions` | C | role_id, permission_id |
-| `membership_roles` | C | membership_id, role_id |
-| `audit_logs` | B | tenant_id, actor_type, actor_id, action, resource_type, resource_id, metadata, ip, correlation_id, created_at |
+| `tenants` | A\* | `name`, `slug` (unique), `status` (`active`/`suspended`), `deleted_at` |
+| `users` | A | `email` (unique), `password_hash`, `display_name`, `status` (`active`/`suspended`/`deactivated`), `session_epoch`, `failed_logins`, `locked_until`, `email_verified_at`, `last_login_at` |
+| `memberships` | C | `tenant_id`, `user_id`, `status` (`invited`/`active`/`suspended`), `invited_by_id`, `accepted_at` — unique `(tenant_id, user_id)` |
+| `roles` | A/B | `slug`, `name`, `description`, `tenant_id` (nullable; null = system role), `is_system` |
+| `permissions` | A | `slug` (unique), `description` |
+| `role_permissions` | C | `role_id`, `permission_id` — unique `(role_id, permission_id)` |
+| `membership_roles` | C | `membership_id`, `role_id` — unique `(membership_id, role_id)` |
+| `sessions` | A | `user_id`, `tenant_id` (nullable), `token_digest` (unique), `csrf_digest`, `session_epoch`, `issued_at`, `last_seen_at`, `idle_expires_at`, `absolute_expires_at`, `revoked_at`, `ip`, `user_agent` |
+| `api_keys` | B | `tenant_id`, `key_id` (unique), `secret_digest`, `name`, `scopes`, `created_by_id`, `last_used_at`, `revoked_at`, `expires_at` |
+| `email_tokens` | A | `user_id`, `purpose` (`email_verification`/`password_reset`), `token_digest`, `expires_at`, `consumed_at` |
+| `audit_logs` | B | `tenant_id`, `actor_type`, `actor_user_id`, `actor_api_key_id`, `action`, `outcome`, `resource_type`, `resource_id`, `context` (jsonb), `ip`, `correlation_id`, `request_id` |
 
 \* `tenants` is the tenant root, so it carries `id` rather than `tenant_id`.
+
+**Divergences from the original sketch, and why.**
+
+| Sketch | Built | Reason |
+|---|---|---|
+| `users.email` is `citext` | `text` with a `CHECK (email = lower(email))` | ADR-0015. Avoids widening the extension surface and keeps the invariant explicit in the schema. The application normalises on the way in; the constraint means no future code path can create `Ada@` beside `ada@` and give one mailbox two accounts |
+| `roles.name`, `permissions.code` | `roles.slug`, `permissions.slug` | The stored value is the string the domain layer, the API and `security.md` §3 already use (`conversations.reply`). `name` is kept on `roles` as the human label |
+| One unique constraint on roles | Two **partial** unique indexes | A system role has `tenant_id IS NULL`, and NULLs do not collide in a plain unique index — which would allow unlimited duplicate system roles. `roles_slug_idx` is unique `WHERE tenant_id IS NULL`; `roles_tenant_id_slug_idx` is unique `WHERE tenant_id IS NOT NULL` |
+| `sessions` keyed to a user only | `sessions.tenant_id` is nullable | A session exists before a tenant is chosen, and signing in against a tenant you do not belong to must produce a tenantless session rather than an error (ADR-0015) |
+
+**Foreign keys and `ON DELETE` semantics.** `RESTRICT` is the default, per §6. The deliberate exceptions:
+
+| Child | Parent | Behaviour | Reason |
+|---|---|---|---|
+| `memberships` | `tenants`, `users` | `CASCADE` | A membership has no meaning without both ends |
+| `membership_roles` | `memberships` | `CASCADE` | Part of the membership aggregate |
+| `membership_roles` | `roles` | **`RESTRICT`** | Deleting a role out from under its holders would silently strip their permissions instead of failing loudly. Covered by an integration test |
+| `role_permissions` | `roles`, `permissions` | `CASCADE` / `RESTRICT` | A role owns its grants; a permission in use may not vanish |
+| `sessions`, `email_tokens` | `users` | `CASCADE` | Credentials do not outlive the account |
+| `api_keys` | `tenants` | `CASCADE` | Tenant-owned |
+| `api_keys.created_by_id`, `memberships.invited_by_id` | `users` | `SET NULL` | Attribution should degrade, not block deleting a user |
+| `audit_logs` | anything | `SET NULL` / no FK on `resource_id` | An audit record must survive the thing it describes |
+
+**Indexes.** `tenants_status_idx` · `memberships_user_id_idx` · `memberships_tenant_id_status_idx` · `roles_slug_idx` (partial unique) · `roles_tenant_id_slug_idx` (partial unique) · `role_permissions_permission_id_idx` · `membership_roles_role_id_idx` · `sessions_user_id_idx` · `sessions_tenant_id_user_id_idx` · `sessions_absolute_expires_at_idx` (for the future reaper) · `api_keys_tenant_id_created_at_idx` · `email_tokens_user_id_purpose_idx` · `audit_logs_tenant_id_created_at_idx` · `audit_logs_actor_user_id_created_at_idx` · `audit_logs_action_created_at_idx`.
+
+The unique index on `sessions.token_digest` and on `api_keys.key_id` is what makes authentication a single indexed lookup rather than a scan that hashes every stored row.
+
+**Seeded reference data.** The migration inserts the 15 permissions of `security.md` §3, the six system roles, and their grants. This is reference data that the authorisation code cannot function without, not domain data — no tenant, user or membership row is created. An integration test asserts the seeded grants match the domain table exactly, so the two cannot drift.
 
 ### 4.2 Event backbone
 
@@ -80,7 +118,7 @@ Indexes: partial `(available_at, created_at) WHERE status = 'pending'`; partial 
 
 **`delivery_attempts`** — tenant_id, message_id, provider, idempotency_key (unique), attempt_no, request_fingerprint, status, provider_message_id, provider_status_code, error, started_at, completed_at.
 
-Full semantics: `messaging.md` §3–§5.
+Full semantics: `messaging.md` §3–§5. **This is the Phase 4 scope.**
 
 ### 4.3 Channels
 
@@ -137,6 +175,8 @@ Details in `billing.md`.
 5. Create indexes `CONCURRENTLY` in production migrations.
 6. Review `pg_stat_statements` and unused-index reports each release; drop indexes that earn nothing.
 
+Rule 5 does not apply to `0002_identity_access`: it creates the tables and their indexes in the same migration, on tables that are empty by definition, so there is nothing to lock. `CONCURRENTLY` becomes mandatory the first time an index is added to a populated identity table.
+
 ---
 
 ## 6. Constraints and integrity
@@ -145,6 +185,8 @@ Details in `billing.md`.
 - Uniqueness that encodes business rules: `(provider, provider_event_id)`, `(tenant_id, channel_type, provider_user_id)`, `(consumer, outbox_event_id)`, `(tenant_id, sku)`.
 - Check constraints for enums, non-negative quantities and amounts, and valid date ranges.
 - Composite foreign keys including `tenant_id` where practical, so a child row cannot reference a parent in another tenant.
+
+Phase 3 adds to that list: `(tenant_id, user_id)` on `memberships` — a person cannot join the same tenant twice — plus `email = lower(email)` on `users`, non-negative checks on `session_epoch` and `failed_logins`, and status checks on `tenants`, `users`, `memberships`, `email_tokens` and `audit_logs`.
 
 ---
 
@@ -157,6 +199,8 @@ Details in `billing.md`.
 - Pessimistic locking (`SELECT ... FOR UPDATE`) only for short, critical state transitions such as subscription changes.
 - Per-conversation serialisation uses an advisory lock keyed by conversation id, so concurrent inbound events cannot interleave.
 - Default isolation is `READ COMMITTED`; anything stricter must be justified in review.
+
+Identity writes are all short single-statement or few-statement transactions and need none of the locking machinery above. Argon2id hashing is deliberately expensive, so it is performed **outside** the database transaction, never while holding a row lock.
 
 ---
 
@@ -172,7 +216,8 @@ Details in `billing.md`.
 5. Lock-avoidance: `CREATE INDEX CONCURRENTLY`, `ADD CONSTRAINT ... NOT VALID` then `VALIDATE`, batched backfills with a statement timeout.
 6. Every destructive migration ships with: a written plan, a fresh verified backup, a rehearsal against a production-like dataset, and a rollback/recovery note.
 7. CI runs the full upgrade path; production deploy runs migrations before the new image serves traffic, and blocks on failure.
-8. **Implemented in Phase 2:** the Alembic environment is async, reads the separate migration DSN from validated settings, and the initial migration only enables required extensions. No domain tables exist yet.
+8. **Implemented in Phase 2:** the Alembic environment is async, reads the separate migration DSN from validated settings, and the initial migration only enables required extensions.
+9. **Implemented in Phase 3:** `0002_identity_access` (down revision `0001_initial_infra`). It is a pure **expand** step — it only creates tables, indexes and reference rows, touches nothing that exists, and is safe to apply while the previous version serves traffic, so rule 2 is satisfied trivially and rule 3 is not at risk. Its `downgrade()` drops the eleven tables in dependency order. Migration 0001 was **not** modified. Migrations are never run from application startup; the Compose topology and CI both run `alembic upgrade head` as a separate one-shot step using the migration role.
 
 ---
 
@@ -188,6 +233,8 @@ Default is **hard delete**. Soft deletion (`deleted_at`) is permitted only where
 | `tenants`, `memberships` | Offboarding grace period and recovery |
 
 Everywhere else, delete. Soft-deleted rows must be excluded by the repository layer by default and purged by a retention job.
+
+**Phase 3:** `tenants.deleted_at` is the only soft-delete column implemented, and `TenantRepository` filters `deleted_at IS NULL` by default, so a soft-deleted tenant is invisible without any caller opting in. `memberships` uses a `status` column instead — a suspended membership keeps its row and its history but resolves to no principal, which serves the same offboarding purpose with clearer semantics than a nullable timestamp. `users` are deactivated by status, never deleted, because audit records reference them. No purge job exists yet.
 
 ---
 
@@ -210,3 +257,5 @@ Bounded pools sized per process type (API vs worker vs beat), with `pool_pre_pin
 | Conversations/messages | Tenant-configurable, subject to a platform minimum |
 
 Retention jobs run in the `maintenance` queue, in batches, off-peak.
+
+**Not yet enforced.** No retention job exists. Two identity tables will need one: `audit_logs` grows without bound, and `sessions` accumulates expired rows — `sessions_absolute_expires_at_idx` exists so that reaper can be cheap when it is written.
