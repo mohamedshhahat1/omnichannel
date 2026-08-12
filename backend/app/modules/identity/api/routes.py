@@ -416,7 +416,6 @@ async def list_roles(
     summary="List memberships in the caller's tenant",
 )
 async def list_members(
-    session: DatabaseSessionDep,
     principal: PrincipalDep,
     provisioning: ProvisioningServiceDep,
     resolver: PermissionResolverDep,
