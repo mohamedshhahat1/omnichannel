@@ -20,6 +20,7 @@ Statuses: `Proposed` · `Accepted` · `Superseded` · `Deprecated`.
 | [ADR-0012](#adr-0012--website-crawler-as-an-isolated-untrusted-workload) | Website crawler as an isolated untrusted workload | Accepted |
 | [ADR-0013](#adr-0013--standard-api-error-envelope-and-error-taxonomy) | Standard API error envelope and error taxonomy | Accepted |
 | [ADR-0014](#adr-0014--async-infrastructure-foundation) | Async infrastructure foundation | Accepted |
+| [ADR-0015](#adr-0015--identity-tenancy-and-credential-handling) | Identity, tenancy and credential handling | Accepted |
 
 ---
 
@@ -296,7 +297,7 @@ Swapping providers (MinIO ↔ S3 ↔ R2 ↔ Spaces) is an adapter change plus a 
 
 ## ADR-0009 — Authentication: opaque server-side sessions in secure cookies
 
-**Status:** Accepted · 2026-08-11 · *(replaces the earlier undecided "sessions or JWT" position)*
+**Status:** Accepted · 2026-08-11 · *(replaces the earlier undecided "sessions or JWT" position; implemented in Phase 3 — see ADR-0015)*
 
 ### Context
 The first client is a first-party web dashboard used by tenant admins and human agents who handle customer conversations. Immediate revocation matters (staff offboarding, compromised device, password reset). Machine clients and provider webhooks need a different mechanism.
@@ -554,3 +555,70 @@ Phase 2 had to add the infrastructure foundation without introducing business do
 
 ### Future migration path
 When measured need exists: add PgBouncer for connection pressure, managed PostgreSQL/Redis for operational burden, dedicated worker pools by queue for backlog isolation, and a result backend only for a documented consumer and retention policy. Preserve the same settings and service interfaces so that operational evolution does not require an application rewrite.
+
+---
+
+## ADR-0015 — Identity, tenancy and credential handling
+
+**Status:** Accepted · 2026-08-12 · *(introduced during Phase 3 implementation; implements ADR-0009 and gives ADR-0002 its enforcement mechanism)*
+
+### Context
+ADR-0009 fixed the authentication *design*: opaque server-side sessions, Argon2id, double-submit CSRF, hashed API keys in the `oc_{env}_{key_id}_{secret}` format. ADR-0002 fixed the tenancy *strategy*: one shared schema with `tenant_id` on every tenant-owned row, scoped at the application boundary.
+
+Neither said how those properties are *guaranteed* once real code exists. Building Phase 3 forced seven questions that the earlier ADRs leave open, and each of them is a security boundary rather than a coding-style preference:
+
+- ADR-0002 says a missing `tenant_id` filter is "a data-leak class of bug" and names scoped repositories as the control — but nothing so far *prevents* a developer from writing a bare query.
+- Returning 403 for an object that belongs to another tenant confirms that the object exists. Returning 404 does not. The earlier ADRs never chose.
+- The permission catalogue exists in `docs/security.md` prose, in Python enums, and in seeded database rows. Three copies of a security rule will drift.
+- `docs/security.md` requires case-insensitive e-mail identity, which in PostgreSQL usually implies `citext`.
+- ADR-0009 allows a Redis session cache with PostgreSQL authoritative, but says nothing about caching *role* lookups, which is the actual per-request cost.
+- Nothing prevented an API key from being minted with more authority than the person minting it.
+- "Sign out everywhere" needs to invalidate sessions that a single `DELETE` cannot cheaply reach.
+
+### Decision
+
+**1. Tenant scoping is structural, not conventional.** Tenant-owned data is reachable only through a repository constructed with a `TenantContext`. `TenantScopedRepository` holds the tenant and applies it; there is no code path that takes a `tenant_id` argument a caller could omit or supply from a request body. Repositories that are legitimately global (user lookup by e-mail, session lookup by digest, API-key lookup by `key_id`) are separate classes with names that say so, so the exceptions are visible rather than incidental.
+
+**2. Cross-tenant access to a real object is 404, never 403.** A 403 says "this exists and is not yours", which is an enumeration oracle for identifiers. The same rule applies to authentication: signing in against a tenant you do not belong to produces a session with no principal rather than an error, so "no such workspace" and "not your workspace" are indistinguishable. 403 is reserved for a caller who *is* a member of the tenant but lacks the permission; a missing membership is 404.
+
+**3. The RBAC catalogue is seeded by the migration and asserted against the domain table by a test.** The database rows are what actually authorise a request, so they are the operative copy; the Python enums exist so application code can reason about permissions without a query. An integration test compares the seeded `role_permissions` rows against `DEFAULT_ROLE_GRANTS` per role. If the two ever diverge, the build fails rather than the database silently winning.
+
+**4. E-mail is a plain `text` column with a lowercase `CHECK`, not `citext`.** The application normalises addresses on the way in; the constraint guarantees no future code path can insert `Ada@example.com` beside `ada@example.com` and hand one mailbox two accounts. The uniqueness index is therefore an ordinary one.
+
+**5. The Redis role-slug cache is a bounded-staleness optimisation.** PostgreSQL stays authoritative, matching ADR-0009's posture for the session cache. The cache degrades to a direct query when Redis is absent, so the API remains correct — merely slower — during a Redis outage, consistent with ADR-0003's "Redis is disposable" rule.
+
+**6. API-key scopes are intersected against the creator's permissions at issue time.** A key can never carry more authority than the person who minted it, so a compromised key cannot be used to escalate by re-issuing a broader one. An unrecognised scope is a 422 that names it; a real scope the caller does not hold is the same 403 that calling the endpoint directly would produce.
+
+**7. Session invalidation uses a `session_epoch` counter on the user.** Incrementing it invalidates every outstanding session in one write, without enumerating rows, and covers sessions created between the read and the write.
+
+Supporting rules that follow from the above: only digests of session tokens, CSRF tokens and API-key secrets are persisted; an API key's plaintext is returned exactly once, in the response that created it; audit context is scrubbed against a marker list before it is written; and response schemas are built field by field rather than from ORM attributes, so a column added later cannot leak by default.
+
+### Alternatives
+1. Pass `tenant_id` explicitly to every query and rely on review plus tests.
+2. Rely on PostgreSQL RLS as the Phase 3 isolation mechanism.
+3. Return 403 for cross-tenant access, as most frameworks do by default.
+4. Treat the Python permission table as authoritative and derive the seed from it at runtime.
+5. Use `citext` for e-mail.
+6. Cache the fully resolved permission set rather than role slugs.
+7. Delete session rows to implement "sign out everywhere".
+
+### Rejection rationale
+1. This is the status quo ADR-0002 already identified as a data-leak class of bug. Review catches most omissions; "most" is not a security boundary, and the failure is silent.
+2. RLS is the P2 defence-in-depth layer, not the primary mechanism — ADR-0002 already settled that, and it protects only the SQL surface. Adding it now would also require a per-transaction session variable on every connection before any code depends on it.
+3. It leaks existence. The cost of returning 404 is one confusing support ticket a year; the cost of 403 is a working identifier oracle.
+4. Seeding from application code at runtime means the migration is not self-contained, cannot be reviewed as SQL, and would let a code change silently alter permissions in production without a migration. The parity test gives the same protection without that coupling.
+5. `citext` is a reasonable choice, but it widens the extension surface, and its comparison semantics are locale-dependent in ways that are easy to get subtly wrong. An explicit `CHECK` plus application normalisation is portable, greppable and obvious in the schema.
+6. Permission sets are larger, change shape when the catalogue changes, and would need invalidating on any grant edit. Role slugs are small and stable, and expanding slugs to permissions in process is cheap.
+7. Deleting rows loses the audit trail and races with sessions created during the delete. A counter comparison is atomic and leaves history intact.
+
+### Consequences
+- A new module gets tenant isolation by extending `TenantScopedRepository`; it does not get to invent its own scoping.
+- Permission changes become visible after at most `session_cache_ttl_seconds` (default 60 s). This is a deliberate, documented staleness window, not an accident.
+- The parity test couples the migration to the domain table on purpose: changing a role grant requires a new migration *and* a domain change, and forgetting either fails CI.
+- 404-for-cross-tenant means logs and traces are the only way to distinguish "missing" from "forbidden" during support. `internal_message` carries the real reason, per ADR-0013.
+- Argon2id at the documented cost makes login deliberately expensive; tests run at the settings floor, and the production floor is enforced by a settings validator rather than by convention.
+- E-mail verification and password reset are modelled (`email_tokens`) but have no transport yet, so those flows are incomplete until the P1 delivery work lands.
+- Login is throttled per account, not per source address; per-address limiting needs the shared rate limiter that does not exist yet.
+
+### Future migration path
+Add RLS policies keyed on a per-transaction `app.tenant_id` as defence in depth once the schema stabilises — the repository layer already guarantees the value is server-derived, so RLS becomes a second lock on the same door rather than a redesign. Add TOTP MFA, SSO and custom roles behind the same `Principal`/permission-resolution point, so authorisation call sites do not change. If the staleness window ever becomes unacceptable, publish an invalidation message on role change instead of shortening the TTL.
