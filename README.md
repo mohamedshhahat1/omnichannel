@@ -2,8 +2,8 @@
 
 Multi-tenant SaaS platform for AI-powered omnichannel customer conversations across WhatsApp, Instagram DM, Facebook Messenger, and Instagram/Facebook comments.
 
-> **Current phase: 2 — Infrastructure foundation.**
-> The `backend/` FastAPI foundation now includes configuration, logging, correlation, error handling, health checks, tracing bootstrap, PostgreSQL/Redis/Celery infrastructure, Alembic, Docker/Compose, and Phase 2 pytest coverage. There is still no authentication, RBAC, business functionality, or ORM domain models yet.
+> **Current phase: 3 — Identity & access.**
+> The `backend/` FastAPI foundation includes configuration, logging, correlation, error handling, health checks, tracing bootstrap, PostgreSQL/Redis/Celery infrastructure, Alembic, Docker/Compose, and now users, tenants, memberships, RBAC, sessions, API keys and audit logging. There is still no conversation, channel, AI, catalog or billing functionality.
 
 ## Read this first
 
@@ -21,12 +21,13 @@ This repository's documentation is the persistent source of truth for both human
 
 | Path | Purpose |
 |---|---|
-| [backend/](backend/) | FastAPI application and Phase 2 infrastructure foundation. |
+| [backend/](backend/) | FastAPI application, infrastructure foundation, and the identity module. |
 
 ```bash
 cd backend
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+alembic upgrade head          # migrations are never run from app startup
 uvicorn app.main:app --reload
 ```
 
@@ -62,6 +63,21 @@ docker compose up --build
 - Dockerfile, Compose stack, PostgreSQL role bootstrap, and Makefile targets
 - `/health/live` remains dependency-free; `/health/ready` checks PostgreSQL and Redis with bounded timeouts
 - Unit tests plus opt-in real PostgreSQL/Redis integration tests; SQLite is never used
+
+## Phase 3 identity now present
+
+- Eleven identity tables in migration `0002_identity_access`, which also seeds the 15-permission catalogue and the six system roles
+- Opaque, revocable sessions in `__Host-` cookies; only SHA-256 digests are stored, never the token
+- Argon2id password hashing with rehash detection and a production cost floor the settings validator refuses to start below
+- Double-submit CSRF on every unsafe method; bearer API keys bypass it because they are not cookies
+- Tenant-scoped API keys — shown once at creation, always expiring, revocable, and never grantable beyond the creator's own permissions
+- RBAC enforced in the service layer, so a future Celery task or AI tool uses the identical check
+- `TenantScopedRepository`, so tenant isolation is structural rather than a filter each caller must remember
+- Enumeration resistance: identical responses for unknown vs. registered addresses, and `404` rather than `403` for cross-tenant objects
+- Audit logging with context scrubbing, covering authentication, membership, role and API-key events
+- 13 endpoints under `/api/v1`, plus unit and integration tests including negative cross-tenant and adversarial cases
+
+The reasoning behind the parts of this that are not obvious is in [ADR-0015](DECISIONS.md#adr-0015--identity-tenancy-and-credential-handling).
 
 ## Core architectural commitments
 
