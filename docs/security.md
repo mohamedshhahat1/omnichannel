@@ -53,13 +53,13 @@ Revocation is immediate and complete:
 | Sign out | Revoke that session row; effective on the next request, with nothing to evict |
 | Sign out everywhere | Revoke all sessions for the user **and** bump `session_epoch` |
 | Password reset or change | Revoke all sessions, issue one new one |
-| Role changed | `ProvisioningService.assign_role` invalidates that membership's cached role slugs immediately (`PermissionResolver.invalidate`). The session itself stays valid — a role change is not a sign-out |
+| Role changed | `ProvisioningService.assign_role` invalidates that membership's cached effective permissions immediately (`PermissionResolver.invalidate`). The session itself stays valid — a role change is not a sign-out |
 | Membership removed or suspended | The membership resolves to no principal, so authorisation stops. Bump `session_epoch` as well if the session must die too |
 | Account disabled | Revoke all sessions, block issuance |
 
 > **Corrected 2026-08-12 (Phase 0–3 audit).** Earlier versions of §2.2 and this section described a Redis read-through cache in front of session lookups, and credited the epoch check with keeping that "≤ 60 s cache from becoming a revocation hole". **No session cache exists.** `SessionService.find_live()` reads PostgreSQL on every authenticated request, so a revoked row stops working at once and there is no hole to close. `app/modules/identity/services/sessions.py` opens by saying so: *"PostgreSQL is the record of truth for sessions (ADR-0009). That is the whole reason revocation works: a revoked row is revoked for every process immediately, with no cache entry to expire."*
 
-The epoch still earns its place, for a different reason: **it invalidates every session a user holds in one write, without enumerating rows.** That is what makes "sign out everywhere", a password change and an offboarding atomic and race-free — a session issued a moment after a row-by-row sweep would survive the sweep but not the epoch. Note that the epoch does **not** cover the role cache in §2.10; role changes are invalidated explicitly by the service instead.
+The epoch still earns its place, for a different reason: **it invalidates every session a user holds in one write, without enumerating rows.** That is what makes "sign out everywhere", a password change and an offboarding atomic and race-free — a session issued a moment after a row-by-row sweep would survive the sweep but not the epoch. Note that the epoch does **not** cover the effective-permission cache in §2.10; role changes are invalidated explicitly by the service instead.
 
 ### 2.4 CSRF protection
 
@@ -129,6 +129,7 @@ TOTP MFA and step-up authentication for sensitive actions · passkeys/WebAuthn �
 | API keys: `key_id` indexed for a single lookup, only the secret digest stored, plaintext returned once at creation, mandatory expiry, revocation, tenant scoping | `identity/services/api_keys.py` |
 | Session metadata (IP, user agent, created, last seen) captured on the row | `identity/models.py`, `identity/api/routes.py` |
 | Every authentication event audit-logged with outcome and reason | `identity/services/audit.py` |
+| Effective permissions resolved from PostgreSQL `role_permissions`, cached in Redis as a permission set, invalidated on role assignment | `identity/services/permissions.py`, `identity/repositories.py` |
 
 **Deviations from the text above — the code does not yet match the design.**
 
@@ -148,9 +149,11 @@ TOTP MFA and step-up authentication for sensitive actions · passkeys/WebAuthn �
 | Area | Limitation | Why it is accepted |
 |---|---|---|
 | Session lookup | There is **no Redis session cache**. Every authenticated request performs one indexed `sessions` read against PostgreSQL | It is a single lookup on a unique index, and it is what makes revocation genuinely immediate (§2.3). Adding a cache would buy little and would reintroduce a staleness window on the most security-sensitive path in the system |
-| RBAC resolution | Effective permissions are resolved from the **in-process `DEFAULT_ROLE_GRANTS` table**, not by reading `role_permissions` at runtime. `PermissionResolver` reads a membership's role *slugs* from the database and expands them in Python | The catalogue is fixed: six system roles and fifteen permissions, all shipped in code and seeded by migration. An integration test asserts the seeded rows and the domain table match exactly, so the two cannot drift. This is the first thing that must change if tenant-defined custom roles are ever added (P2) |
-| Role cache | Role slugs — not sessions, not permissions — are cached in Redis for `session_cache_ttl_seconds` (default 60 s, max 300 s). A role change made **directly in the database** can take that long to take effect | Changes made through the API invalidate the entry explicitly, so the window only applies to out-of-band edits. The cache degrades to PostgreSQL-only if Redis is unavailable |
+| Effective-permission cache | The resolved permission set is cached in Redis for `session_cache_ttl_seconds` (default 60 s, max 300 s). A grant edited **directly in the database**, bypassing the service layer, can take that long to take effect | Every mutation the application performs invalidates the entry explicitly (§3.2), so the window only applies to out-of-band SQL. The cache degrades to PostgreSQL-only if Redis is unavailable, and a malformed entry is treated as a miss, so it can never widen a permission set |
+| Role/grant administration | There is no API for creating a role or editing `role_permissions`. Grants arrive via migration `0002_identity_access` | Phase 3 ships a fixed catalogue of six system roles. The resolution path and the invalidation hook already support runtime edits, so exposing them is wiring rather than redesign (`TODO.md` P1) |
 | Audit log | `audit_logs` is append-only **by convention**, not by database permission or trigger | §10.1. The application never issues an `UPDATE` or `DELETE` against it; nothing at the database level yet stops one |
+
+> **Corrected 2026-08-12 (RBAC correction).** This table previously carried a fourth limitation, *"RBAC resolution — effective permissions are resolved from the in-process `DEFAULT_ROLE_GRANTS` table, not by reading `role_permissions` at runtime"*, and a *"Role cache"* entry describing Redis as holding role slugs. Both described the implementation accurately at the time and both are now obsolete: runtime authorization queries `role_permissions`, and the cache holds effective permissions. The rows are replaced rather than merely edited because neither is a limitation any more. The history is retained here, and in ADR-0015's correction note, so the change is traceable.
 
 ---
 
@@ -170,7 +173,7 @@ Permission check = active session/API key
 
 **Default roles:** Owner (all) · Admin (all except billing/ownership transfer) · Manager (conversations, catalog, knowledge, AI config) · Agent (conversations read/reply/assign) · Billing Admin (billing only) · Viewer (read only).
 
-Roles are data, so custom roles and finer-grained permissions can be added without a schema redesign. **As built, that is true of the schema but not yet of the runtime** — see §3.2.
+Roles are data, so custom roles and finer-grained permissions can be added without a schema redesign. **As of the 2026-08-12 RBAC correction this is true of the runtime as well as the schema** — a role with its own `role_permissions` rows is resolved and enforced with no code change. See §3.2.
 
 ### 3.1 Grant matrix as seeded (Phase 3)
 
@@ -194,16 +197,22 @@ Migration `0002_identity_access` seeds exactly this. `●` = granted.
 | `apikeys.manage` | ● | ● | | | | |
 | `audit.read` | ● | ● | | | | |
 
-### 3.2 Implementation status (Phase 3)
+This table is the **initial** matrix. It is what `DEFAULT_ROLE_GRANTS` seeds and what the migration writes; it is not a description of what the roles necessarily grant today, because `role_permissions` is editable data. To read the live matrix, query `role_permissions` or call `GET /api/v1/roles`, which reports each role's grants from those rows.
+
+### 3.2 Implementation status (Phase 3, corrected 2026-08-12)
 
 - Checks live in `identity/services/authorization.py` and are called from services, not routes, so a future Celery task or AI tool uses the identical path.
 - **A member who lacks a permission gets 403. A caller with no membership in the tenant gets 404**, so an identifier cannot be probed for existence. This is deliberate; see ADR-0015.
-- **Where the grant matrix is actually read at runtime.** `PermissionResolver.permissions_for()` reads a membership's role *slugs* from `membership_roles`/`roles`, then expands those slugs into a permission set using the in-process `DEFAULT_ROLE_GRANTS` table in `identity/domain.py`. **`role_permissions` is not queried on the request path.** The seeded rows are the reviewed, migrated, queryable copy of the same matrix, and an integration test compares them against `DEFAULT_ROLE_GRANTS` per role so the two cannot drift silently — but the Python table is the operative one. Editing `role_permissions` in the database alone changes nothing at runtime. Recorded as an architectural limitation in §2.10.
+- **PostgreSQL `role_permissions` is the runtime RBAC source of truth.** `PermissionResolver` resolves a membership's effective permission set with a single query that walks `membership_roles → roles → role_permissions → permissions`, scoped to the caller's tenant. Editing a grant in the database changes authorization behaviour on the next resolution.
+- **`DEFAULT_ROLE_GRANTS` defines the initial/default system-role grant matrix used for seeding, reference and testing, and is not consulted during runtime authorization.** It is imported by migration `0002_identity_access`'s seed data and by tests; no module on the authorization path imports it. The direction is Python defaults → initial database seed, never Python defaults → runtime decision.
+- The effective permission set is cached in Redis under `oc:{env}:t:{tenant_id}:rbac-perms:{membership_id}`, holding the resolved permission slugs rather than role slugs, so no reader has to re-derive a decision from a slug. The tenant id is a structural part of the key, so one tenant's entry is not addressable from another. `PermissionResolver.invalidate(membership_id)` is the invalidation hook; `ProvisioningService.assign_role` calls it, and any future role-removal or role-permission mutation must call it too.
 - Only an owner may grant the owner role.
-- An API key's scopes are intersected against the creator's permissions at issue time, so a key can never carry more authority than the person who minted it. An unknown scope is 422; a real scope the caller does not hold is 403.
-- Unknown role slugs resolve to no permissions rather than raising — the resolver fails closed.
+- An API key's scopes are intersected against the creator's permissions at issue time, so a key can never carry more authority than the person who minted it. An unknown scope is 422; a real scope the caller does not hold is 403. Because the creator's permissions now come from the database, a key cannot be minted with authority its creator only holds in the Python matrix.
+- Unknown role slugs resolve to no permissions, a permission slug stored outside the `Permission` catalogue is dropped rather than raising, and an unreadable or malformed cache entry is treated as a miss — the resolver fails closed at every step.
 - A suspended membership keeps its row but resolves to no principal, so access stops without destroying history.
 - **Plan entitlement is not part of the check yet** — the billing module does not exist. The line stays in the model above because entitlement will slot into the same choke point.
+
+> **Corrected 2026-08-12 (RBAC correction).** This section previously stated: *"`PermissionResolver.permissions_for()` reads a membership's role slugs … then expands those slugs into a permission set using the in-process `DEFAULT_ROLE_GRANTS` table … `role_permissions` is not queried on the request path … the seeded rows are the reviewed, migrated, queryable copy of the same matrix … but the Python table is the operative one."* That was an accurate description of the implementation as delivered in Phase 3 and is no longer true. `role_permissions` is queried on the request path and is operative; the Python table seeds it. Tests in `backend/tests/integration/test_identity_rbac_resolution.py` enforce the new direction by mutating `role_permissions` and asserting the authorization answer follows the database while `DEFAULT_ROLE_GRANTS` still disagrees.
 
 ---
 
@@ -212,7 +221,7 @@ Migration `0002_identity_access` seeds exactly this. `●` = granted.
 | Surface | Control | Status |
 |---|---|---|
 | SQL | Tenant-scoped repositories inject `tenant_id`; unscoped access to tenant tables is prohibited outside reviewed admin paths | **Implemented (Phase 3)** — `TenantScopedRepository`; scoping is structural, so a caller cannot express an unscoped query. Globally-scoped lookups (user by e-mail, session by digest, API key by `key_id`) are separate, explicitly named classes |
-| Redis | Key namespace `oc:{env}:t:{tenant_id}:{purpose}:{key}` | **Implemented (Phase 2, used in Phase 3)** by the RBAC role cache |
+| Redis | Key namespace `oc:{env}:t:{tenant_id}:{purpose}:{key}` | **Implemented (Phase 2, used in Phase 3)** by the RBAC effective-permission cache, whose key carries the tenant id structurally |
 | Celery | Every payload carries `tenant_id`; the task rebuilds the trusted context before touching data | Implemented (Phase 2); no identity tasks exist yet |
 | Object storage | Keys prefixed `tenants/{tenant_id}/...`; signed URLs issued only after an authorisation check | Pending — module not started |
 | Vector search | `tenant_id` predicate applied before ranking, in the repository — not in caller code | Pending — module not started |
@@ -224,7 +233,7 @@ Migration `0002_identity_access` seeds exactly this. `●` = granted.
 
 **Testing:** every module with tenant data ships tests asserting that tenant A cannot read, update, delete, retrieve, or reference tenant B — including through AI tools and signed URLs.
 
-Phase 3 covers the SQL surface for identity: a real, active membership in another tenant resolves to `None` by id and by user, never appears in a listing, and cross-tenant revocation of a real API key answers 404. Redis, object storage, retrieval and tools remain to be covered as those modules land.
+Phase 3 covers the SQL surface for identity: a real, active membership in another tenant resolves to `None` by id and by user, never appears in a listing, and cross-tenant revocation of a real API key answers 404. The 2026-08-12 RBAC correction adds the Redis surface for the permission cache: two tenants occupy distinct keys, invalidating one leaves the other intact, and a membership id from another tenant resolves to no permissions rather than to its real ones. Object storage, retrieval and tools remain to be covered as those modules land.
 
 RLS is planned as an additional layer once the schema stabilises (ADR-0002).
 
@@ -311,7 +320,7 @@ The `audit_logs` table exists with tenant, actor, action, outcome, resource, con
 
 Each carries an outcome, and failures carry a reason (`locked_out`, `bad_credentials`, `inactive_account`). Correlation and request ids are pulled from the ambient context by the audit service itself, so no call site can forget them.
 
-Not yet implemented: append-only enforcement at the database level (the table is append-only by convention, not by permission or trigger), the 12-month retention policy, and a read endpoint gated by `audit.read`. The remaining action list belongs to modules that do not exist yet.
+Not yet implemented: append-only enforcement at the database level (the table is append-only by convention, not by permission or trigger), the 12-month retention policy, and a read endpoint gated by `audit.read`. Role-permission mutations are not audited because no code path performs one; the action list must grow when the P1 role administration API lands. The remaining actions belong to modules that do not exist yet.
 
 ---
 
@@ -336,6 +345,7 @@ Not yet implemented: append-only enforcement at the database level (the table is
 | | Crawler resource abuse | Hard limits and container quotas |
 | **Elevation of privilege** | Missing authorisation check | Service-layer enforcement, per-permission tests |
 | | **API key minted with more scope than its creator** | Scopes intersected against the creator's permissions at issue time |
+| | **Stale or forged permission cache entry** | Tenant id is structural in the cache key; a malformed entry is a miss, not a grant; the TTL is bounded and mutations invalidate explicitly |
 | | Prompt injection → tool abuse | Tools authorise independently of the model |
 | | SSRF → internal access | IP/DNS/redirect validation, IP pinning, egress restriction |
 
@@ -349,9 +359,10 @@ Pinned dependencies with lock files · vulnerability scanning in CI with a docum
 
 ## 13. Launch security checklist
 
-No box below is ticked. Phase 3 was authored in an environment with no network and no installed dependencies, so `pytest`, `ruff`, `mypy` and Docker could not be executed there; CI is the first authoritative run. Items are annotated with what exists today.
+No box below is ticked. Phase 3 was authored in an environment with no network and no installed dependencies, so `pytest`, `ruff`, `mypy` and Docker could not be executed there; CI is the first authoritative run. The 2026-08-12 RBAC correction was authored under the same constraint and has not been executed either. Items are annotated with what exists today.
 
-- [ ] Cross-tenant isolation tests passing across DB, Redis, storage, retrieval and tools — *DB surface written for identity in Phase 3 (negative cross-tenant cases by id, by user, in listings, and on revocation); Redis, storage, retrieval and tools pending those modules*
+- [ ] Cross-tenant isolation tests passing across DB, Redis, storage, retrieval and tools — *DB surface written for identity in Phase 3 (negative cross-tenant cases by id, by user, in listings, and on revocation); Redis surface written for the permission cache in the RBAC correction; storage, retrieval and tools pending those modules*
+- [ ] Runtime authorisation proven to read `role_permissions` — *tests written in `test_identity_rbac_resolution.py`; never executed*
 - [ ] All webhooks signature-verified with replay protection — *Phase 4+*
 - [ ] Argon2id parameters tuned and benchmarked — *parameters are configurable with a production floor enforced by settings validation; not yet benchmarked on production hardware*
 - [ ] Session rotation, revocation and epoch invalidation verified — *implemented and covered by written tests; awaiting a green CI run*
