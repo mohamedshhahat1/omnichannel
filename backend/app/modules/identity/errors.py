@@ -40,10 +40,40 @@ class AuthenticationFailedError(UnauthorizedError):
     default_message = "Authentication failed."
 
 
+class AmbiguousCredentialsError(UnauthorizedError):
+    """A request presented both a session cookie and a bearer credential.
+
+    `docs/security.md` 2.8 makes the two mutually exclusive per request. This
+    is raised *before* either credential is examined, so the response cannot
+    reveal which of them - if either - would have been accepted.
+
+    It is a distinct code rather than a plain `authentication_failed` because
+    the caller is a client that can fix the request, and the fix ("send one
+    credential") is not guessable from a generic failure. Nothing about the
+    validity of either credential is disclosed by saying that two were sent,
+    which the caller already knows.
+    """
+
+    default_code = "ambiguous_credentials"
+    default_message = "Present either a session cookie or an API key, not both."
+
+
 class CsrfValidationError(ForbiddenError):
     """A cookie-authenticated state-changing request failed its CSRF check."""
 
     default_code = "csrf_validation_failed"
+    default_message = "The request could not be verified. Please retry."
+
+
+class OriginRejectedError(ForbiddenError):
+    """A cookie-authenticated write came from an origin that is not allowed.
+
+    `docs/security.md` 2.4 layer 3. The reason - unparsable header, missing
+    header, foreign origin - stays in `internal_message`, because naming it
+    would let a caller map the allowlist one request at a time.
+    """
+
+    default_code = "origin_rejected"
     default_message = "The request could not be verified. Please retry."
 
 
@@ -101,6 +131,20 @@ class MembershipAlreadyExistsError(ConflictError):
 
     default_code = "membership_already_exists"
     default_message = "That person is already a member of this workspace."
+
+
+class MembershipTransitionError(ConflictError):
+    """The membership cannot move from its current status to the requested one.
+
+    Raised when activation is attempted on a membership that is neither invited
+    nor already active - a suspended one, for instance. Reinstating suspended
+    access is a separate decision with its own authorisation story, and letting
+    an activation call perform it silently would turn "accept an invitation"
+    into "undo a suspension".
+    """
+
+    default_code = "membership_transition_invalid"
+    default_message = "That membership cannot be activated from its current state."
 
 
 class LastOwnerError(ConflictError):
