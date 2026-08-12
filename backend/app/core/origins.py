@@ -22,10 +22,10 @@ The rules, in order:
    includes the literal `null` origin a sandboxed iframe or a `data:` document
    sends, which is exactly the context an attacker controls.
 3. An origin on the allowlist passes.
-4. An origin whose host matches the request's own `Host` passes. This is what
-   keeps the first-party dashboard working without every deployment having to
-   duplicate its own address into the allowlist. An attacker cannot forge it:
-   the browser sets `Origin` from the page that made the request.
+4. An origin whose host *and port* match the request's own `Host` passes. This
+   is what keeps the first-party dashboard working without every deployment
+   having to duplicate its own address into the allowlist. An attacker cannot
+   forge it: the browser sets `Origin` from the page that made the request.
 5. Absent `Origin` *and* `Referer` is a rejection only when the caller asks for
    presence to be required. That switch is on in production unconditionally
    (see `Settings.require_origin_on_cookie_writes`); elsewhere it is off so
@@ -88,12 +88,19 @@ def normalize_origin(value: str | None) -> str | None:
 
 
 def _host_matches(origin: str, host_header: str | None) -> bool:
-    """True when an origin names the same host the request was addressed to.
+    """True when an origin names the same host *and port* the request went to.
 
-    Only the host is compared, not the scheme. Behind a TLS terminator the
+    The scheme is deliberately not compared. Behind a TLS terminator the
     application sees plain HTTP while the browser reports `https://`, so
     comparing schemes would refuse every same-origin write in production. The
     scheme is still policed separately by `require_https`.
+
+    The port is compared, because a different port is a different origin. Two
+    services on one host - the dashboard on 443, something experimental on
+    8443 - are separate trust domains, and the weaker one must not inherit the
+    stronger one's writes. A `Host` with no port means the request arrived on
+    the scheme's default port, and `normalize_origin` has already dropped
+    default ports, so an origin still carrying one names a different port.
     """
     if not host_header:
         return False
@@ -109,9 +116,8 @@ def _host_matches(origin: str, host_header: str | None) -> bool:
     if stated_host != (origin_parts.hostname or "").lower():
         return False
     if stated_port is None:
-        return True
-    origin_port = origin_parts.port or _DEFAULT_PORTS[origin_parts.scheme]
-    return stated_port == origin_port
+        return origin_parts.port is None
+    return stated_port == (origin_parts.port or _DEFAULT_PORTS[origin_parts.scheme])
 
 
 def evaluate_origin(
