@@ -20,7 +20,7 @@ Statuses: `Proposed` · `Accepted` · `Superseded` · `Deprecated`.
 | [ADR-0012](#adr-0012--website-crawler-as-an-isolated-untrusted-workload) | Website crawler as an isolated untrusted workload | Accepted |
 | [ADR-0013](#adr-0013--standard-api-error-envelope-and-error-taxonomy) | Standard API error envelope and error taxonomy | Accepted |
 | [ADR-0014](#adr-0014--async-infrastructure-foundation) | Async infrastructure foundation | Accepted |
-| [ADR-0015](#adr-0015--identity-tenancy-and-credential-handling) | Identity, tenancy and credential handling | Accepted |
+| [ADR-0015](#adr-0015--identity-tenancy-and-credential-handling) | Identity, tenancy and credential handling | Accepted · corrected 2026-08-12 |
 
 ---
 
@@ -334,6 +334,8 @@ The first client is a first-party web dashboard used by tenant admins and human 
 ### Future migration path
 Add TOTP MFA and step-up authentication for sensitive actions; add OIDC/SAML SSO and SCIM for enterprise tenants behind the same session issuance point; add passkeys/WebAuthn. Because sessions are opaque and server-side, adding an external IdP changes only how a session is *established*, not how it is *validated*.
 
+> **Implementation note added 2026-08-12 (Phase 0–3 audit).** The decision text above says "Redis caches session lookups with a short TTL". **No session cache was built.** `SessionService.find_live()` reads PostgreSQL on every authenticated request, which makes revocation immediate with no cache entry to expire. The permitted cache was instead spent on RBAC resolution — see ADR-0015 decision 5 and its 2026-08-12 correction. The ADR text is left as written; this note records what shipped.
+
 ---
 
 ## ADR-0010 — OpenTelemetry as the tracing and correlation standard
@@ -560,7 +562,7 @@ When measured need exists: add PgBouncer for connection pressure, managed Postgr
 
 ## ADR-0015 — Identity, tenancy and credential handling
 
-**Status:** Accepted · 2026-08-12 · *(introduced during Phase 3 implementation; implements ADR-0009 and gives ADR-0002 its enforcement mechanism)*
+**Status:** Accepted · 2026-08-12 · *(introduced during Phase 3 implementation; implements ADR-0009 and gives ADR-0002 its enforcement mechanism)* · **corrected 2026-08-12 — see [the correction note](#correction--2026-08-12--rbac-resolution-made-database-authoritative) at the end of this ADR. Decision 5 is superseded and rejected alternative 6 has been adopted; the text below is preserved as originally written.**
 
 ### Context
 ADR-0009 fixed the authentication *design*: opaque server-side sessions, Argon2id, double-submit CSRF, hashed API keys in the `oc_{env}_{key_id}_{secret}` format. ADR-0002 fixed the tenancy *strategy*: one shared schema with `tenant_id` on every tenant-owned row, scoped at the application boundary.
@@ -622,3 +624,31 @@ Supporting rules that follow from the above: only digests of session tokens, CSR
 
 ### Future migration path
 Add RLS policies keyed on a per-transaction `app.tenant_id` as defence in depth once the schema stabilises — the repository layer already guarantees the value is server-derived, so RLS becomes a second lock on the same door rather than a redesign. Add TOTP MFA, SSO and custom roles behind the same `Principal`/permission-resolution point, so authorisation call sites do not change. If the staleness window ever becomes unacceptable, publish an invalidation message on role change instead of shortening the TTL.
+
+### Correction — 2026-08-12 — RBAC resolution made database-authoritative
+
+*Everything above is preserved exactly as accepted. This note records a subsequent change rather than rewriting the record, so that the reasoning that produced the original design stays legible.*
+
+**What changed.** Runtime authorization no longer expands role slugs through `DEFAULT_ROLE_GRANTS`. `PermissionResolver` resolves a membership's effective permission set from PostgreSQL, walking `membership_roles → roles → role_permissions → permissions` in one query, and caches that set in Redis.
+
+- **PostgreSQL `role_permissions` is the runtime RBAC source of truth.**
+- **`DEFAULT_ROLE_GRANTS` defines the initial/default system-role grant matrix used for seeding/reference/testing, but is not consulted during runtime authorization.**
+
+The direction is now Python defaults → initial database seed, never Python defaults → runtime decision. No table was added, altered or dropped: the schema this ADR accepted already expressed everything required, which is why the correction needed no migration.
+
+**How each part of the ADR above now stands.**
+
+| Part | Standing after the correction |
+|---|---|
+| Decision 1, 2, 4, 6, 7 | Unaffected. Tenant scoping, 404-for-cross-tenant, the e-mail `CHECK`, scope intersection at issue time and the session epoch are all unchanged |
+| Decision 3, first clause — *"The database rows are what actually authorise a request, so they are the operative copy"* | **Now accurate.** It was not accurate when written. The rows were seeded, indexed and parity-tested, but nothing read them on the request path; the sentence described an intention the code did not implement. It is left unedited because it has become true |
+| Decision 3, the parity test | **Retained, with its meaning changed.** It no longer holds two competing authorities in agreement. It now pins the seed direction — that the migration writes what `DEFAULT_ROLE_GRANTS` says — and a comment in the test says so, to stop a future reader inferring that the constant is consulted at runtime |
+| Decision 5 — *"The Redis role-slug cache…"* | **Superseded.** The cache holds the effective permission set, not role slugs. Everything else in decision 5 survives intact: PostgreSQL stays authoritative, and the cache degrades to a direct query when Redis is absent, so a Redis outage costs latency rather than correctness |
+| Alternative 6 — *"Cache the fully resolved permission set rather than role slugs"*, rejected | **Adopted.** Its rejection rationale was right about the costs and wrong about whether they were worth paying. Permission sets *are* larger and *do* need invalidating on a grant edit — but requiring invalidation on a grant edit is the correct behaviour once grants are authoritative, not a drawback. `PermissionResolver.invalidate` is that hook |
+| Consequences — *"Permission changes become visible after at most `session_cache_ttl_seconds`"* | **Still true, and narrower.** Changes made through the application invalidate the entry immediately, so the window now applies only to a grant edited directly in the database, outside the service layer |
+| Consequences — *"changing a role grant requires a new migration and a domain change"* | **Still true of the six seeded system roles**, and now true for a different reason: the migration is what changes behaviour, and the domain change is what keeps the seed honest. It is not true of a tenant-owned role, which would be plain data |
+| Future migration path — *"publish an invalidation message on role change instead of shortening the TTL"* | **Partially taken.** Invalidation happens in-process at the mutation site rather than by message. A message would only be needed if a writer existed outside the application, which is not the case |
+
+**Why this was not left as a documented limitation.** The Phase 0–3 audit earlier the same day recorded the Python-constant resolution as an accepted architectural limitation, and documented it as such across four files. That was a defensible reading of a fixed six-role catalogue. It was reopened because the arrangement had a property worse than being merely suboptimal: `role_permissions` *looked* authoritative — correctly modelled, seeded, indexed, foreign-keyed, documented in the schema — while changing it did nothing. An operator revoking a grant in the database would have seen the row disappear, no error, and no change in behaviour. A design can be limited without being misleading; this one was both.
+
+**Status of the change.** The implementation, its tests and this note are written and committed to the branch `fix/rbac-database-authoritative`. **Nothing has been executed.** The authoring environment had no Python interpreter, no PostgreSQL and no Redis, so no test, linter or type check was run against any of it. This ADR records a decision that has been implemented, not one that has been verified. Treat the correction as unproven until CI runs it.

@@ -95,13 +95,17 @@ Every table below inherits `id uuid primary key` (UUIDv7, application-generated)
 | `api_keys.created_by_id`, `memberships.invited_by_id` | `users` | `SET NULL` | Attribution should degrade, not block deleting a user |
 | `audit_logs` | anything | `SET NULL` / no FK on `resource_id` | An audit record must survive the thing it describes |
 
+The `RESTRICT` on `membership_roles.role_id` carries more weight after the 2026-08-12 RBAC correction than it did when it was written. Now that grants are read at runtime, deleting a role is a live authorization change rather than a bookkeeping tidy-up, and the constraint is what forces it to be deliberate.
+
 **Indexes.** `tenants_status_idx` · `memberships_user_id_idx` · `memberships_tenant_id_status_idx` · `roles_slug_idx` (partial unique) · `roles_tenant_id_slug_idx` (partial unique) · `role_permissions_permission_id_idx` · `membership_roles_role_id_idx` · `sessions_user_id_idx` · `sessions_tenant_id_user_id_idx` · `sessions_absolute_expires_at_idx` (for the future reaper) · `api_keys_tenant_id_created_at_idx` · `email_tokens_user_id_purpose_idx` · `audit_logs_tenant_id_created_at_idx` · `audit_logs_actor_user_id_created_at_idx` · `audit_logs_action_created_at_idx`.
 
 The unique index on `sessions.token_digest` and on `api_keys.key_id` is what makes authentication a single indexed lookup rather than a scan that hashes every stored row.
 
-**Seeded reference data.** The migration inserts the 15 permissions of `security.md` §3, the six system roles, and their grants. This is reference data that the authorisation code cannot function without, not domain data — no tenant, user or membership row is created. An integration test asserts the seeded grants match the domain table exactly, so the two cannot drift.
+**Seeded reference data.** The migration inserts the 15 permissions of `security.md` §3, the six system roles, and their grants, taken from the `DEFAULT_ROLE_GRANTS` matrix in `app/modules/identity/domain.py`. This is reference data that the authorisation code cannot function without, not domain data — no tenant, user or membership row is created. An integration test asserts the seeded grants match that matrix exactly, which pins the direction: **Python defaults → initial database seed.**
 
-One consequence is worth stating plainly, because the table layout suggests otherwise: **`role_permissions` is not read on the request path.** `PermissionResolver` reads a membership's role *slugs* from `membership_roles`/`roles` and expands those slugs into permissions using the in-process `DEFAULT_ROLE_GRANTS` table in `app/modules/identity/domain.py`. The seeded rows are the reviewed, migrated, queryable copy of the same matrix, held identical by the parity test. Editing `role_permissions` in the database alone therefore changes nothing at runtime. That is deliberate for a fixed catalogue of system roles; it is the thing that has to change first if tenant-defined custom roles are ever added (P2, `TODO.md`).
+**`role_permissions` is the runtime RBAC source of truth.** `PermissionResolver` resolves a membership's effective permissions with one query that joins `membership_roles → roles → role_permissions → permissions`, scoped to the caller's tenant, and caches the resulting set in Redis. **`DEFAULT_ROLE_GRANTS` defines the initial/default system-role grant matrix used for seeding/reference/testing, but is not consulted during runtime authorization.** Editing `role_permissions` therefore changes who can do what, on the next resolution — which is why the grant rows carry the same review weight as the tables themselves, and why a mutation must invalidate the cache (`security.md` §3.2).
+
+> **Corrected 2026-08-12.** This section previously continued: *"One consequence is worth stating plainly, because the table layout suggests otherwise: `role_permissions` is not read on the request path. `PermissionResolver` reads a membership's role slugs from `membership_roles`/`roles` and expands those slugs into permissions using the in-process `DEFAULT_ROLE_GRANTS` table… Editing `role_permissions` in the database alone therefore changes nothing at runtime."* That was true of the implementation as delivered in Phase 3 and is no longer true. The table layout suggested the rows were operative; they now are.
 
 ### 4.2 Event backbone
 
@@ -122,7 +126,7 @@ Indexes: partial `(available_at, created_at) WHERE status = 'pending'`; partial 
 
 **`delivery_attempts`** — tenant_id, message_id, provider, idempotency_key (unique), attempt_no, request_fingerprint, status, provider_message_id, provider_status_code, error, started_at, completed_at.
 
-Full semantics: `messaging.md` §3–§5. **This is the Phase 4 scope.**
+Full semantics: `messaging.md` §3–§5. **This is the Phase 4 scope.** None of these four tables exists; the 2026-08-12 RBAC correction created none of them.
 
 ### 4.3 Channels
 
@@ -181,6 +185,8 @@ Details in `billing.md`.
 
 Rule 5 does not apply to `0002_identity_access`: it creates the tables and their indexes in the same migration, on tables that are empty by definition, so there is nothing to lock. `CONCURRENTLY` becomes mandatory the first time an index is added to a populated identity table.
 
+Rule 2 is why the permission-resolution query added on 2026-08-12 needs no new index: it joins `membership_roles` on its primary key, `roles` and `permissions` on theirs, and `role_permissions` on its composite primary key, all of which migration `0002` already created.
+
 ---
 
 ## 6. Constraints and integrity
@@ -222,6 +228,7 @@ Identity writes are all short single-statement or few-statement transactions and
 7. CI runs the full upgrade path; production deploy runs migrations before the new image serves traffic, and blocks on failure.
 8. **Implemented in Phase 2:** the Alembic environment is async, reads the separate migration DSN from validated settings, and the initial migration only enables required extensions.
 9. **Implemented in Phase 3:** `0002_identity_access` (down revision `0001_initial_infra`). It is a pure **expand** step — it only creates tables, indexes and reference rows, touches nothing that exists, and is safe to apply while the previous version serves traffic, so rule 2 is satisfied trivially and rule 3 is not at risk. Its `downgrade()` drops the eleven tables in dependency order. Migration 0001 was **not** modified. Migrations are never run from application startup; the Compose topology and CI both run `alembic upgrade head` as a separate one-shot step using the migration role.
+10. **No migration was added on 2026-08-12.** Making `role_permissions` runtime-authoritative required no schema change: the tables, keys and indexes created by `0002_identity_access` already expressed the relationships the resolver needed. `alembic heads` remains `0002_identity_access`.
 
 ---
 
@@ -239,6 +246,8 @@ Default is **hard delete**. Soft deletion (`deleted_at`) is permitted only where
 Everywhere else, delete. Soft-deleted rows must be excluded by the repository layer by default and purged by a retention job.
 
 **Phase 3:** `tenants.deleted_at` is the only soft-delete column implemented, and `TenantRepository` filters `deleted_at IS NULL` by default, so a soft-deleted tenant is invisible without any caller opting in. `memberships` uses a `status` column instead — a suspended membership keeps its row and its history but resolves to no principal, which serves the same offboarding purpose with clearer semantics than a nullable timestamp. `users` are deactivated by status, never deleted, because audit records reference them. No purge job exists yet.
+
+The permission-resolution query added on 2026-08-12 respects this: it joins through `memberships` filtered on `deleted_at IS NULL`, so a soft-deleted tenant's membership resolves to no permissions rather than to its historical ones.
 
 ---
 
