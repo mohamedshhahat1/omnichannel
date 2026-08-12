@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.database import Base, create_database_engine, create_session_factory, session_scope
 from app.core.settings import DatabaseSettings
+from app.modules.identity import models  # noqa: F401
 
 
 def test_engine_is_async_and_does_not_connect_during_construction() -> None:
@@ -29,14 +30,30 @@ def test_session_factory_is_bound_to_engine() -> None:
         asyncio.run(engine.dispose())
 
 
-def test_metadata_has_stable_constraint_names_and_no_phase2_tables() -> None:
+def test_metadata_has_stable_constraint_names_and_registers_identity_tables() -> None:
+    # Importing app.modules.identity.models (top of file) registers the
+    # module's tables on the shared Base metadata, which is what Alembic
+    # autogenerate diffs against. Phase 1 asserted this metadata was empty;
+    # Phase 2 populated it, so pin the exact table set instead.
     convention = Base.metadata.naming_convention
     assert convention is not None
     assert convention["pk"] == "%(table_name)s_pk"
     fk = convention["fk"]
     assert isinstance(fk, str)
     assert fk.startswith("fk_")
-    assert list(Base.metadata.tables) == []
+    assert set(Base.metadata.tables) == {
+        "tenants",
+        "users",
+        "memberships",
+        "roles",
+        "permissions",
+        "role_permissions",
+        "membership_roles",
+        "sessions",
+        "api_keys",
+        "email_tokens",
+        "audit_logs",
+    }
 
 
 @pytest.mark.asyncio
