@@ -141,6 +141,7 @@ TOTP MFA and step-up authentication for sensitive actions · passkeys/WebAuthn �
 | 2.5 | Rate limited per account **and per IP** | Per-account lockout only | Outstanding — needs the shared rate limiter (P1) |
 | 2.2 | Rotation on password change and email change | Those endpoints do not exist yet, so only login issues a fresh session | Deferred with the endpoints |
 | 2.6 | E-mail verification and password reset | `email_tokens` is modelled and migrated; no transport is wired, so neither flow is usable | Deferred to the P1 delivery work |
+| 2.6 / 2.7 | An invited person joins the tenant and then works inside it | `ProvisioningService.invite_member` creates the membership with status `invited`. **No code path performs the `invited → active` transition**, and both `_select_tenant` (login) and `_principal_for_session` (every request) require `active`. The invitee can authenticate with the initial password the inviter set, but every tenant-scoped request answers `404` until the row is activated directly in SQL | Outstanding, and broader than §2.6 above: the missing piece is the state transition, not only the transport. The two API-key integration tests activate the membership with raw SQL for exactly this reason. Tracked in `TODO.md` under P1 → Security. Discovered by the 2026-08-12 audit |
 | 2.2 | "Your devices" screen | Metadata is captured; no listing endpoint exists | Deferred |
 | 2.9 | MFA, passkeys, SSO | Not started, explicitly P2 | Deferred |
 
@@ -209,7 +210,7 @@ This table is the **initial** matrix. It is what `DEFAULT_ROLE_GRANTS` seeds and
 - Only an owner may grant the owner role.
 - An API key's scopes are intersected against the creator's permissions at issue time, so a key can never carry more authority than the person who minted it. An unknown scope is 422; a real scope the caller does not hold is 403. Because the creator's permissions now come from the database, a key cannot be minted with authority its creator only holds in the Python matrix.
 - Unknown role slugs resolve to no permissions, a permission slug stored outside the `Permission` catalogue is dropped rather than raising, and an unreadable or malformed cache entry is treated as a miss — the resolver fails closed at every step.
-- A suspended membership keeps its row but resolves to no principal, so access stops without destroying history.
+- A suspended membership keeps its row but resolves to no principal, so access stops without destroying history. An **invited** membership resolves the same way, which is why the missing acceptance transition in §2.10 leaves an invitee locked out rather than partially privileged — the failure is closed, but it is still a gap.
 - **Plan entitlement is not part of the check yet** — the billing module does not exist. The line stays in the model above because entitlement will slot into the same choke point.
 
 > **Corrected 2026-08-12 (RBAC correction).** This section previously stated: *"`PermissionResolver.permissions_for()` reads a membership's role slugs … then expands those slugs into a permission set using the in-process `DEFAULT_ROLE_GRANTS` table … `role_permissions` is not queried on the request path … the seeded rows are the reviewed, migrated, queryable copy of the same matrix … but the Python table is the operative one."* That was an accurate description of the implementation as delivered in Phase 3 and is no longer true. `role_permissions` is queried on the request path and is operative; the Python table seeds it. Tests in `backend/tests/integration/test_identity_rbac_resolution.py` enforce the new direction by mutating `role_permissions` and asserting the authorization answer follows the database while `DEFAULT_ROLE_GRANTS` still disagrees.
@@ -320,7 +321,7 @@ The `audit_logs` table exists with tenant, actor, action, outcome, resource, con
 
 Each carries an outcome, and failures carry a reason (`locked_out`, `bad_credentials`, `inactive_account`). Correlation and request ids are pulled from the ambient context by the audit service itself, so no call site can forget them.
 
-Not yet implemented: append-only enforcement at the database level (the table is append-only by convention, not by permission or trigger), the 12-month retention policy, and a read endpoint gated by `audit.read`. Role-permission mutations are not audited because no code path performs one; the action list must grow when the P1 role administration API lands. The remaining actions belong to modules that do not exist yet.
+Not yet implemented: append-only enforcement at the database level (the table is append-only by convention, not by permission or trigger), the 12-month retention policy, and a read endpoint gated by `audit.read`. Role-permission mutations are not audited because no code path performs one; the action list must grow when the P1 role administration API lands. There is likewise no `membership.accept` action, because no code path performs that transition either (§2.10). The remaining actions belong to modules that do not exist yet.
 
 ---
 
@@ -359,13 +360,16 @@ Pinned dependencies with lock files · vulnerability scanning in CI with a docum
 
 ## 13. Launch security checklist
 
-No box below is ticked. Phase 3 was authored in an environment with no network and no installed dependencies, so `pytest`, `ruff`, `mypy` and Docker could not be executed there; CI is the first authoritative run. The 2026-08-12 RBAC correction was authored under the same constraint and has not been executed either. Items are annotated with what exists today.
+Phase 3 and the 2026-08-12 RBAC correction were both authored in environments with no network and no installed dependencies, so `pytest`, `ruff`, `mypy` and Docker could not be executed there; CI was always going to be the first authoritative run. **It has now run.** The operator reports the pipeline green for the merged tree as of 2026-08-12, after four rounds of CI-surfaced defects that were fixed on `fix/rbac-database-authoritative` before it was merged. Two consequences for reading this list:
 
-- [ ] Cross-tenant isolation tests passing across DB, Redis, storage, retrieval and tools — *DB surface written for identity in Phase 3 (negative cross-tenant cases by id, by user, in listings, and on revocation); Redis surface written for the permission cache in the RBAC correction; storage, retrieval and tools pending those modules*
-- [ ] Runtime authorisation proven to read `role_permissions` — *tests written in `test_identity_rbac_resolution.py`; never executed*
+- Where an item below depends only on **written tests having been executed**, it is ticked, annotated with the fact that the evidence is the operator's CI report. No automated agent has accessed GitHub Actions results, and per repository policy none may.
+- Every other item is unticked because the control itself does not exist yet, not because it is unproven. Those are marked with what exists today.
+
+- [ ] Cross-tenant isolation tests passing across DB, Redis, storage, retrieval and tools — *DB surface written and executed for identity (negative cross-tenant cases by id, by user, in listings, and on revocation); Redis surface written and executed for the permission cache; storage, retrieval and tools pending those modules, so the row cannot be ticked*
+- [x] Runtime authorisation proven to read `role_permissions` — *`test_identity_rbac_resolution.py` mutates `role_permissions` and asserts the answer follows the database while `DEFAULT_ROLE_GRANTS` disagrees; executed in CI with both `OC_TEST_DATABASE_URL` and `OC_TEST_REDIS_URL` set, so none of the four cache tests skipped. Evidence: operator's CI report, 2026-08-12*
 - [ ] All webhooks signature-verified with replay protection — *Phase 4+*
 - [ ] Argon2id parameters tuned and benchmarked — *parameters are configurable with a production floor enforced by settings validation; not yet benchmarked on production hardware*
-- [ ] Session rotation, revocation and epoch invalidation verified — *implemented and covered by written tests; awaiting a green CI run*
+- [x] Session rotation, revocation and epoch invalidation verified — *implemented and covered by integration tests against real PostgreSQL, executed in CI. Evidence: operator's CI report, 2026-08-12*
 - [ ] CSRF and CORS verified with a hostile-origin test — *double-submit implemented and tested; `Origin`/`Referer` validation not implemented*
 - [ ] Rate limits on auth, webhooks, AI and uploads — *per-account lockout only; no shared rate limiter yet*
 - [ ] Secret scanning and dependency scanning green — *not yet added to CI*
