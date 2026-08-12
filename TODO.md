@@ -9,9 +9,11 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 ## P0 — Blocking
 
 ### Verify the Phase 2 foundation in a networked environment
-- [x] Run `pytest`, `ruff check .`, `ruff format --check .`, and `mypy` in `backend/` on a machine with network access, and fix any findings
-- [x] Run opt-in PostgreSQL/Redis integration tests with `OC_TEST_DATABASE_URL` and `OC_TEST_REDIS_URL`
+- [ ] Run `pytest`, `ruff check .`, `ruff format --check .`, and `mypy` in `backend/` on a machine with network access, and fix any findings
+- [ ] Run opt-in PostgreSQL/Redis integration tests with `OC_TEST_DATABASE_URL` and `OC_TEST_REDIS_URL`
 - [ ] Regenerate `backend/requirements.lock` with a real resolver, transitive dependencies, and hashes; review the diff
+
+> **Corrected 2026-08-12 (Phase 0–3 audit).** The first two items were previously ticked. They were unticked because no authoring environment for Phase 2 or Phase 3 had network access, so these gates have never been executed in this repository. That is what `CURRENT_STATE.md` §7 ("could not be run and must not be assumed to pass"), `docs/security.md` §13 ("CI is the first authoritative run") and the *Verify Phase 3 in CI* item below all say. The tests are **written**; they are not **executed** or **verified**. Re-tick only against an observed run.
 
 ### Verify Phase 3 in CI
 - [ ] Run and observe GitHub Actions for the Phase 3 commits; the authoring environment had no network and could not execute `pytest`, `ruff`, `mypy`, `alembic` or Docker, so CI is the first authoritative run of those gates
@@ -45,7 +47,10 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 - [x] Audit logging with context scrubbing, asserted not to contain an attempted password
 - [x] Unit and integration tests for identity, including adversarial and negative cross-tenant cases, on real PostgreSQL
 
-### Completed in Phase 14 ✅
+### Completed alongside Phase 2 — CI/CD foundation ✅
+
+> **Renamed 2026-08-12 (Phase 0–3 audit).** This section was headed "Completed in Phase 14". That was a mislabel: Phase 14 in the `docs/architecture.md` §15 roadmap is *CI/CD & production deployment*, a future phase that has **not** started. The work below is the CI foundation delivered next to Phase 2, which `CURRENT_STATE.md` calls "CI/CD Foundation". No content changed.
+
 - [x] CI workflow (`.github/workflows/ci.yml`) with seven separate required checks on every PR and every push to `main`/`phase-2-infrastructure`: Ruff lint, Ruff format, MyPy, unit Pytest, integration Pytest against real PostgreSQL/Redis service containers, production Docker image build (no push), and `docker compose config` validation — no secrets, least-privilege `contents: read`
 - [x] CI guardrail test (`backend/tests/unit/test_ci_workflow.py`) validating workflow paths, Python version, commands, working directories, dependency installation and service configuration
 - [x] Fixed the hermetic test environment stripping `OC_TEST_*`, which would have silently skipped the opt-in Phase 2 integration tests in CI
@@ -82,6 +87,7 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 - [x] Central authorisation checks in the service layer, with per-permission tests — delivered in Phase 3 (`app/modules/identity/services/authorization.py`); every later module must route through it rather than checking permissions in a route
 - [ ] Cross-tenant isolation test suite (database, Redis, object storage, retrieval, tools) — the database surface is covered for identity in Phase 3; Redis, object storage, retrieval and tools are still outstanding
 - [ ] Per-endpoint and per-source-address rate limiting — Phase 3 added per-account lockout only, so login is throttled per identity but not per caller
+- [ ] Reject a request that presents both a session cookie and an API key, instead of preferring the bearer key — recorded as a known deviation in `docs/security.md` §2.10, which refers to this list
 - [ ] E-mail delivery for verification and password reset; `email_tokens` is modelled and migrated but has no transport
 - [ ] Secret scanning and dependency vulnerability scanning in CI
 - [ ] Log redaction rules and PII minimisation review
@@ -149,6 +155,7 @@ Prioritised backlog. **P0** = blocks the next phase or is a launch blocker · **
 | Offline-authored dependency pin set | No resolver/network in the authoring environment | Regenerated in CI or another networked environment |
 | `app/platform` and `app/core/logging.py` shadow stdlib module names | Safe under Python 3 absolute imports; names match the approved architecture | Only if a dependency performs implicit relative imports |
 | Redis role-slug cache staleness window | Avoids a role join on every authenticated request; bounded by `session_cache_ttl_seconds` (default 60 s) | Permission changes must take effect instantly |
+| Effective permissions resolved from the Python `DEFAULT_ROLE_GRANTS` table rather than by reading `role_permissions` at runtime | The grant matrix is code plus seeded migration data, not runtime-editable configuration. `PermissionResolver` reads role *slugs* from the database and expands them in process; an integration test asserts the seeded rows and the domain table match exactly, so the two cannot drift | Custom or tenant-defined roles become a requirement (P2), at which point the grant matrix has to become data |
 | `email_tokens` modelled without a delivery path | The table and lifecycle belong with the identity schema; transport is a separate concern | E-mail verification or password reset becomes a product requirement |
 | Login throttled per account, not per source address | Per-account lockout protects the account; per-address limiting needs the shared rate limiter that does not exist yet | The P1 rate limiting work is picked up |
 | Plain `text` e-mail column with a lowercase CHECK rather than `citext` | Smaller extension surface; the constraint is explicit and portable | Case-insensitive matching is needed where the CHECK cannot reach |

@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT
 
-> **Status:** Phase 0 — Architecture approved with corrections applied.
+> **Status:** Phases 0–3 implemented — architecture & documentation, application foundation, infrastructure foundation, and identity & access. Phase 4 (Event Backbone) is **NOT STARTED**. Implementation presence is verified against the repository; execution of the quality gates (Pytest, Ruff, MyPy, Alembic, Docker) is **not** — see `CURRENT_STATE.md`.
 > **Audience:** Human engineers and future AI coding sessions.
 > **Rule:** This file, together with `CURRENT_STATE.md`, `ENGINEERING.md`, `DECISIONS.md`, `TODO.md` and `docs/`, is the persistent source of truth for this project. Read these before writing any code.
 
