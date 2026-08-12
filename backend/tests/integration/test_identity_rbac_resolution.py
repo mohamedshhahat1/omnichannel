@@ -344,9 +344,7 @@ async def test_the_cached_value_is_the_effective_permission_set(
 
     try:
         await resolver.permissions_for(workspace.membership.id)
-        key = (
-            f"oc:{ENVIRONMENT}:t:{workspace.tenant.id}:rbac-perms:{workspace.membership.id}"
-        )
+        key = f"oc:{ENVIRONMENT}:t:{workspace.tenant.id}:rbac-perms:{workspace.membership.id}"
         stored = await redis_client.get(key)
         assert stored is not None, "the resolution should have been cached"
         assert Permission.CONVERSATIONS_READ.value in stored
