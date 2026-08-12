@@ -25,7 +25,7 @@ left behind in the database.
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from redis.asyncio import Redis
@@ -182,16 +182,19 @@ async def _revoke_grant(
     permission: Permission,
 ) -> None:
     """Delete one role -> permission row from the system role's grants."""
-    result: CursorResult[Any] = await session.execute(
-        text(
-            "DELETE FROM role_permissions "
-            "WHERE role_id = ("
-            "  SELECT id FROM roles WHERE slug = :role AND tenant_id IS NULL"
-            ") AND permission_id = ("
-            "  SELECT id FROM permissions WHERE slug = :permission"
-            ")"
+    result = cast(
+        CursorResult[Any],
+        await session.execute(
+            text(
+                "DELETE FROM role_permissions "
+                "WHERE role_id = ("
+                "  SELECT id FROM roles WHERE slug = :role AND tenant_id IS NULL"
+                ") AND permission_id = ("
+                "  SELECT id FROM permissions WHERE slug = :permission"
+                ")"
+            ),
+            {"role": role.value, "permission": permission.value},
         ),
-        {"role": role.value, "permission": permission.value},
     )
     assert result.rowcount == 1, "expected exactly one seeded grant to be removed"
 
