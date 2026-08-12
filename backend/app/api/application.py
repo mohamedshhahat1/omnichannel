@@ -46,6 +46,7 @@ from app.core.observability import (
     instrument_infrastructure,
     shutdown_tracing,
 )
+from app.core.security import PasswordHashingService
 from app.core.settings import Settings, get_settings
 from app.platform.health import HealthRegistry
 
@@ -137,6 +138,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.tracer_provider = tracer_provider
     app.state.started = False
     app.state.infrastructure = None
+    # Phase 3. An Argon2 hasher is a set of cost parameters, not a connection,
+    # so it needs no lifespan management - but rebuilding it per request would
+    # re-read settings on every single login for no reason.
+    app.state.password_hashing = PasswordHashingService(settings.auth)
 
     _register_middleware(app, settings)
     register_exception_handlers(app)
