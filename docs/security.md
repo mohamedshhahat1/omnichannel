@@ -32,7 +32,7 @@ The first client is a first-party dashboard used by tenant admins and agents han
 | Token | 256 bits from a CSPRNG, base64url-encoded, opaque — carries no claims |
 | Storage | `sessions` row with **SHA-256 hash** of the token; the plaintext exists only in the cookie |
 | Source of truth | PostgreSQL |
-| Cache | Redis read-through, TTL ≤ 60 s, explicitly invalidated on revocation |
+| Cache | **None.** Every authenticated request reads the `sessions` row from PostgreSQL — see the correction note in §2.3 |
 | Cookie name | `__Host-oc_session` |
 | Cookie flags | `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, **no `Domain`** |
 | Idle expiry | 7 days sliding (`last_seen_at` refreshed at most once per minute) |
@@ -50,13 +50,16 @@ Revocation is immediate and complete:
 
 | Action | Effect |
 |---|---|
-| Sign out | Delete/revoke that session row, evict the cache key |
-| Sign out everywhere | Revoke all sessions for the user |
+| Sign out | Revoke that session row; effective on the next request, with nothing to evict |
+| Sign out everywhere | Revoke all sessions for the user **and** bump `session_epoch` |
 | Password reset or change | Revoke all sessions, issue one new one |
-| Membership removed / role changed | Bump the user's `session_epoch`; cached sessions with an older epoch are rejected on next use |
+| Role changed | `ProvisioningService.assign_role` invalidates that membership's cached role slugs immediately (`PermissionResolver.invalidate`). The session itself stays valid — a role change is not a sign-out |
+| Membership removed or suspended | The membership resolves to no principal, so authorisation stops. Bump `session_epoch` as well if the session must die too |
 | Account disabled | Revoke all sessions, block issuance |
 
-The epoch check is what keeps the ≤ 60 s cache from becoming a revocation hole: the epoch is compared on every request, so a permission change takes effect on the next request, not after TTL expiry.
+> **Corrected 2026-08-12 (Phase 0–3 audit).** Earlier versions of §2.2 and this section described a Redis read-through cache in front of session lookups, and credited the epoch check with keeping that "≤ 60 s cache from becoming a revocation hole". **No session cache exists.** `SessionService.find_live()` reads PostgreSQL on every authenticated request, so a revoked row stops working at once and there is no hole to close. `app/modules/identity/services/sessions.py` opens by saying so: *"PostgreSQL is the record of truth for sessions (ADR-0009). That is the whole reason revocation works: a revoked row is revoked for every process immediately, with no cache entry to expire."*
+
+The epoch still earns its place, for a different reason: **it invalidates every session a user holds in one write, without enumerating rows.** That is what makes "sign out everywhere", a password change and an offboarding atomic and race-free — a session issued a moment after a row-by-row sweep would survive the sweep but not the epoch. Note that the epoch does **not** cover the role cache in §2.10; role changes are invalidated explicitly by the service instead.
 
 ### 2.4 CSRF protection
 
@@ -131,7 +134,7 @@ TOTP MFA and step-up authentication for sensitive actions · passkeys/WebAuthn �
 
 | § | Design says | Implementation does | Status |
 |---|---|---|---|
-| 2.8 | A request presenting both a cookie and an API key is **rejected** | The bearer key wins and the cookie is ignored | Deviation. "Rejected" is the safer rule; the code should move to it. Tracked in `TODO.md` |
+| 2.8 | A request presenting both a cookie and an API key is **rejected** | The bearer key wins and the cookie is ignored | Deviation. "Rejected" is the safer rule; the code should move to it. Tracked in `TODO.md` under P1 → Security |
 | 2.4 (3) | `Origin`/`Referer` validated against an allowlist | Not implemented; only `SameSite` and the double-submit token are in place | Outstanding |
 | 2.5 | Passwords checked against a breached-password list | Length and surrounding-whitespace policy only | Outstanding |
 | 2.5 | Rate limited per account **and per IP** | Per-account lockout only | Outstanding — needs the shared rate limiter (P1) |
@@ -139,6 +142,15 @@ TOTP MFA and step-up authentication for sensitive actions · passkeys/WebAuthn �
 | 2.6 | E-mail verification and password reset | `email_tokens` is modelled and migrated; no transport is wired, so neither flow is usable | Deferred to the P1 delivery work |
 | 2.2 | "Your devices" screen | Metadata is captured; no listing endpoint exists | Deferred |
 | 2.9 | MFA, passkeys, SSO | Not started, explicitly P2 | Deferred |
+
+**Architectural limitations — deliberate, and not planned work.** These are not gaps between design and code; they are choices, recorded here so they are not mistaken for either bugs or completed features.
+
+| Area | Limitation | Why it is accepted |
+|---|---|---|
+| Session lookup | There is **no Redis session cache**. Every authenticated request performs one indexed `sessions` read against PostgreSQL | It is a single lookup on a unique index, and it is what makes revocation genuinely immediate (§2.3). Adding a cache would buy little and would reintroduce a staleness window on the most security-sensitive path in the system |
+| RBAC resolution | Effective permissions are resolved from the **in-process `DEFAULT_ROLE_GRANTS` table**, not by reading `role_permissions` at runtime. `PermissionResolver` reads a membership's role *slugs* from the database and expands them in Python | The catalogue is fixed: six system roles and fifteen permissions, all shipped in code and seeded by migration. An integration test asserts the seeded rows and the domain table match exactly, so the two cannot drift. This is the first thing that must change if tenant-defined custom roles are ever added (P2) |
+| Role cache | Role slugs — not sessions, not permissions — are cached in Redis for `session_cache_ttl_seconds` (default 60 s, max 300 s). A role change made **directly in the database** can take that long to take effect | Changes made through the API invalidate the entry explicitly, so the window only applies to out-of-band edits. The cache degrades to PostgreSQL-only if Redis is unavailable |
+| Audit log | `audit_logs` is append-only **by convention**, not by database permission or trigger | §10.1. The application never issues an `UPDATE` or `DELETE` against it; nothing at the database level yet stops one |
 
 ---
 
@@ -158,7 +170,7 @@ Permission check = active session/API key
 
 **Default roles:** Owner (all) · Admin (all except billing/ownership transfer) · Manager (conversations, catalog, knowledge, AI config) · Agent (conversations read/reply/assign) · Billing Admin (billing only) · Viewer (read only).
 
-Roles are data, so custom roles and finer-grained permissions can be added without a schema redesign.
+Roles are data, so custom roles and finer-grained permissions can be added without a schema redesign. **As built, that is true of the schema but not yet of the runtime** — see §3.2.
 
 ### 3.1 Grant matrix as seeded (Phase 3)
 
@@ -186,7 +198,7 @@ Migration `0002_identity_access` seeds exactly this. `●` = granted.
 
 - Checks live in `identity/services/authorization.py` and are called from services, not routes, so a future Celery task or AI tool uses the identical path.
 - **A member who lacks a permission gets 403. A caller with no membership in the tenant gets 404**, so an identifier cannot be probed for existence. This is deliberate; see ADR-0015.
-- The seeded rows are the operative copy of the grant matrix. An integration test compares them against the Python `DEFAULT_ROLE_GRANTS` table per role, so the database and the code cannot drift silently.
+- **Where the grant matrix is actually read at runtime.** `PermissionResolver.permissions_for()` reads a membership's role *slugs* from `membership_roles`/`roles`, then expands those slugs into a permission set using the in-process `DEFAULT_ROLE_GRANTS` table in `identity/domain.py`. **`role_permissions` is not queried on the request path.** The seeded rows are the reviewed, migrated, queryable copy of the same matrix, and an integration test compares them against `DEFAULT_ROLE_GRANTS` per role so the two cannot drift silently — but the Python table is the operative one. Editing `role_permissions` in the database alone changes nothing at runtime. Recorded as an architectural limitation in §2.10.
 - Only an owner may grant the owner role.
 - An API key's scopes are intersected against the creator's permissions at issue time, so a key can never carry more authority than the person who minted it. An unknown scope is 422; a real scope the caller does not hold is 403.
 - Unknown role slugs resolve to no permissions rather than raising — the resolver fails closed.
@@ -293,7 +305,7 @@ Each entry: tenant, actor type and id, action, resource type and id, metadata, I
 
 ### 10.1 Implementation status (Phase 3)
 
-The `audit_logs` table exists with tenant, actor, action, outcome, resource, context, IP, correlation id and timestamp, indexed for the three queries that matter (by tenant over time, by actor over time, by action over time). Actions emitted today:
+The `audit_logs` table exists with tenant, actor, action, outcome, resource, context, IP, correlation id and timestamp, indexed for the three queries that matter (by tenant over time, by actor over time, by action over time). The actor is stored as two nullable foreign keys — `actor_user_id` and `actor_api_key_id` — rather than a polymorphic `actor_type`/`actor_id` pair, so the references stay real; the actor *kind* is derived from which one is set (`observability.md` §2.1). Actions emitted today:
 
 `auth.login` · `auth.logout` · `auth.logout_all` · `identity.register` · `tenant.create` · `membership.invite` · `membership.assign_role` · `apikey.create` · `apikey.revoke`
 
