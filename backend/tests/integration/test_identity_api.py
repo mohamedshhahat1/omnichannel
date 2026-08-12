@@ -193,7 +193,14 @@ async def test_an_unknown_address_is_rejected_identically(client: AsyncClient) -
         json={"email": known["email"], "password": "wrong passphrase entirely"},
     )
     assert unknown.status_code == wrong.status_code == 401
-    assert unknown.json() == wrong.json()
+    # request_id and correlation_id are unique per request by design; the rest
+    # of the envelope must be identical so the response is not an
+    # account-existence oracle. (The service-level twin in
+    # test_identity_persistence.py compares code/message/status directly.)
+    trace = {"request_id", "correlation_id"}
+    unknown_error = {k: v for k, v in unknown.json()["error"].items() if k not in trace}
+    wrong_error = {k: v for k, v in wrong.json()["error"].items() if k not in trace}
+    assert unknown_error == wrong_error
 
 
 async def test_a_short_password_is_refused_without_echoing_it(client: AsyncClient) -> None:
@@ -306,7 +313,7 @@ async def test_an_owner_can_invite_a_member_who_then_has_only_their_role(
 
 
 async def test_an_agent_cannot_manage_api_keys(client: AsyncClient) -> None:
-    _, csrf_token = await _register_and_login(client)
+    owner, csrf_token = await _register_and_login(client)
     invitee = f"agent-{uuid.uuid4().hex}@example.com"
     invited = await client.post(
         f"{API_PREFIX}/members",
@@ -323,9 +330,12 @@ async def test_an_agent_cannot_manage_api_keys(client: AsyncClient) -> None:
     await client.post(f"{API_PREFIX}/auth/logout", headers={"X-CSRF-Token": csrf_token})
     client.cookies.clear()
 
+    # The invitee belongs to exactly one tenant - the owner's. A login names
+    # the workspace it acts in; without tenant_slug the session is tenantless
+    # by design and tenant-scoped routes 404 before any permission check.
     signed_in = await client.post(
         f"{API_PREFIX}/auth/login",
-        json={"email": invitee, "password": PASSWORD},
+        json={"email": invitee, "password": PASSWORD, "tenant_slug": owner["tenant_slug"]},
     )
     assert signed_in.status_code == 200, signed_in.text
     agent_csrf = signed_in.json()["csrf_token"]
@@ -398,7 +408,7 @@ async def test_a_key_authenticates_as_a_bearer_token(client: AsyncClient) -> Non
 
 
 async def test_a_key_cannot_be_granted_more_than_its_creator_holds(client: AsyncClient) -> None:
-    _, csrf_token = await _register_and_login(client)
+    owner, csrf_token = await _register_and_login(client)
     invitee = f"admin-{uuid.uuid4().hex}@example.com"
     await client.post(
         f"{API_PREFIX}/members",
@@ -413,9 +423,12 @@ async def test_a_key_cannot_be_granted_more_than_its_creator_holds(client: Async
     await client.post(f"{API_PREFIX}/auth/logout", headers={"X-CSRF-Token": csrf_token})
     client.cookies.clear()
 
+    # Sign in scoped to the admin's only tenant (see the note in
+    # test_an_agent_cannot_manage_api_keys): without it the session is
+    # tenantless and /api-keys 404s before the scope check runs.
     signed_in = await client.post(
         f"{API_PREFIX}/auth/login",
-        json={"email": invitee, "password": PASSWORD},
+        json={"email": invitee, "password": PASSWORD, "tenant_slug": owner["tenant_slug"]},
     )
     assert signed_in.status_code == 200, signed_in.text
 
