@@ -639,6 +639,10 @@ async def test_an_expired_key_does_not_authenticate(
         text("UPDATE api_keys SET expires_at = :past WHERE id = :id"),
         {"past": utcnow() - timedelta(seconds=1), "id": issued.record.id},
     )
+    # The raw UPDATE bypasses the ORM, so the identity map still holds the
+    # original future expires_at. Expire the row to force authenticate() to
+    # reload the mutated value instead of the cached one.
+    db_session.expire(issued.record)
     assert await service.authenticate(issued.plaintext) is None
 
 
