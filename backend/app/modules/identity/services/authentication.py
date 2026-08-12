@@ -13,6 +13,10 @@ account here?" for free.
 The tenant a session acts in is chosen here, server-side, and stored on the
 session row. Nothing downstream reads a tenant from a header or a body, so
 there is no request field an attacker can edit to move sideways.
+
+The authority a session carries is resolved from PostgreSQL through
+`PermissionResolver`, never from a Python grant table. `permissions_for_roles`
+is deliberately absent from this module's imports.
 """
 
 from __future__ import annotations
@@ -36,7 +40,6 @@ from app.modules.identity.domain import (
     UserStatus,
     normalize_email,
     normalize_tenant_slug,
-    permissions_for_roles,
 )
 from app.modules.identity.errors import AuthenticationFailedError
 from app.modules.identity.repositories import (
@@ -46,7 +49,10 @@ from app.modules.identity.repositories import (
 )
 from app.modules.identity.services.api_keys import ApiKeyService
 from app.modules.identity.services.audit import AuditService
-from app.modules.identity.services.permissions import PermissionResolver, RoleSlugCache
+from app.modules.identity.services.permissions import (
+    EffectivePermissionCache,
+    PermissionResolver,
+)
 from app.modules.identity.services.sessions import IssuedSession, SessionService
 from app.platform.clock import is_expired, seconds_from_now, utcnow
 
@@ -84,7 +90,7 @@ class AuthenticationService:
         passwords: PasswordHashingService,
         sessions: SessionService,
         api_keys: ApiKeyService,
-        cache: RoleSlugCache,
+        cache: EffectivePermissionCache,
         audit: AuditService,
     ) -> None:
         self._session = session
@@ -121,7 +127,12 @@ class AuthenticationService:
             raise self._rejected("no account matches the presented address")
 
         now = utcnow()
-        if not is_expired(user.locked_until, now=now):
+        # `locked_until` is None when the account has never been locked. Unlike
+        # an expiry deadline, where None means "never expires", None here means
+        # "not locked" - so it must not be read through is_expired alone, which
+        # would treat the absent lock as a lock that never lifts. Reject only
+        # while a real lock is still in the future.
+        if user.locked_until is not None and not is_expired(user.locked_until, now=now):
             self._passwords.spend_verification_budget()
             await self._audit_login(
                 outcome=AuditOutcome.FAILURE,
@@ -210,7 +221,9 @@ class AuthenticationService:
             return None
 
         # A key carries scopes, not roles. Widening a role later must not
-        # silently widen every key that was issued under it.
+        # silently widen every key that was issued under it. Scopes were
+        # already intersected against the creator's effective permissions at
+        # issue time, so this path never consulted a role grant table.
         scopes = {str(scope) for scope in record.scopes}
         permissions = frozenset(item for item in Permission if item.value in scopes)
         return Principal(
@@ -320,6 +333,11 @@ class AuthenticationService:
         Recomputed per request rather than stored on the session, so revoking
         a role takes effect on the next request instead of whenever the
         session happens to expire.
+
+        The permission set comes from the resolver, which reads
+        `role_permissions` in PostgreSQL. Both calls below share one resolved
+        value through the resolver's cache, so the roles reported and the
+        permissions granted are always the same generation of the truth.
         """
         if record.tenant_id is None:
             return None
@@ -336,10 +354,11 @@ class AuthenticationService:
 
         resolver = PermissionResolver(memberships, self._cache)
         role_slugs = await resolver.role_slugs_for(membership.id)
+        permissions = await resolver.permissions_for(membership.id)
         return Principal(
             kind=PrincipalKind.USER,
             tenant_id=tenant.id,
-            permissions=permissions_for_roles(role_slugs),
+            permissions=permissions,
             role_slugs=role_slugs,
             user_id=user.id,
             session_id=record.id,

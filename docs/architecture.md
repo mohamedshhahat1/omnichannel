@@ -151,7 +151,7 @@ None of these are implemented. Two are now owed to the identity module: expired-
 ### 4.5 Data plane
 PostgreSQL is the system of record, including vectors. Redis carries the broker, caches, rate limits and short locks. Object storage carries all binaries with tenant-scoped keys.
 
-Phase 3 is the first consumer of that split: sessions, memberships and roles are authoritative in PostgreSQL, while Redis holds only a short-TTL role-slug cache that can be dropped at any moment without affecting correctness.
+Phase 3 is the first consumer of that split, and the clearest illustration of principle 4: sessions, memberships, roles and **the grants in `role_permissions`** are authoritative in PostgreSQL, while Redis holds only a short-TTL cache of the effective permission set that can be dropped at any moment without affecting correctness. A dropped entry costs one join; it never changes an answer.
 
 ---
 
@@ -246,6 +246,8 @@ Cycles are prohibited. If module A needs to react to something in module B, B em
 
 `identity` sits at the root of that graph and, correctly, imports no other domain module — only `core` and `platform`. Every later module depends on it, so it must never depend on any of them. The layering inside it follows the stack above exactly: `domain.py` has no I/O and imports nothing from SQLAlchemy, services orchestrate and authorise, repositories are the only code that issues queries. That is what makes the whole module unit-testable without a database.
 
+The 2026-08-12 RBAC correction is a worked example of the same layering. Making the database authoritative meant adding one query method to `repositories.py` and changing what `services/permissions.py` asks for. `domain.py` was not touched, because the grant matrix it holds is a default rather than a decision, and no route changed, because routes never resolved permissions in the first place.
+
 ---
 
 ## 7. Repository structure (target)
@@ -295,7 +297,7 @@ modules/identity/
 ├─ api/            routes.py, schemas.py, dependencies.py
 ├─ services/       authentication, sessions, api_keys, permissions,
 │                  provisioning, audit, authorization, validation
-├─ domain.py       enums, grants, Principal, TenantContext, normalisation
+├─ domain.py       enums, default grants, Principal, TenantContext, normalisation
 ├─ errors.py       domain errors over the ADR-0013 envelope
 ├─ models.py       the eleven tables
 └─ repositories.py TenantScopedRepository and the global-scope repositories
@@ -320,12 +322,15 @@ What the rule is really protecting is rule 2 of §6: `models` and `repositories`
 | Search | SQL filters + full-text | Hybrid (BM25 + vector) rerank | Measured retrieval quality gap |
 | Tenant isolation | Application-scoped repositories — **implemented in Phase 3** as `TenantScopedRepository`, so scoping is structural rather than a filter each call site must remember | + PostgreSQL RLS | Schema stable, or compliance requirement |
 | Session storage | PostgreSQL authoritative, **no cache** — one indexed lookup on `sessions.token_digest` per authenticated request, plus an epoch check against the user row — **implemented in Phase 3** | Unchanged. A read-through cache is deliberately **not** planned: it would reintroduce a staleness window on the revocation path (`security.md` §2.10) | Auth lookup shows up in latency profiling |
-| Role/permission resolution | Role slugs read from PostgreSQL and cached in Redis for ≤ 60 s, then expanded into permissions through the in-process `DEFAULT_ROLE_GRANTS` table — `role_permissions` is seeded and parity-tested but not read at runtime — **implemented in Phase 3** | `role_permissions` becomes the runtime source, making the grant matrix editable data rather than code | Tenant-defined custom roles (P2) |
+| Role/permission resolution | **PostgreSQL `role_permissions` is the runtime source of truth** — one query per membership walks `membership_roles → roles → role_permissions → permissions`, cached in Redis as an effective permission set for ≤ 60 s and invalidated on mutation. `DEFAULT_ROLE_GRANTS` seeds the rows and is not consulted at runtime — **corrected 2026-08-12** | Unchanged. The grant matrix is already editable data | — |
+| Role administration | No API; grants arrive only via migration `0002_identity_access` | Endpoints to create a tenant-owned role and edit its grants, calling `PermissionResolver.invalidate` | Tenant-defined custom roles (P2) |
 | Outbox dispatch | Poller with `SKIP LOCKED` | + `LISTEN/NOTIFY` hint | Dispatch latency budget < 1 s |
 | Tracing | OTel → collector → Sentry | Tempo/Jaeger or managed APM | Trace volume/retention needs |
 | Crawler | Designed only | Isolated egress-restricted workers | Tenants require website ingestion |
 | Visual search | Schema headroom only | Image embeddings + similarity | Proven customer demand |
 | Rate limiting | Per-account login lockout only | Shared limiter across auth, webhooks, AI and uploads | Before any public exposure |
+
+> **Corrected 2026-08-12.** The role/permission resolution row previously read: CURRENT *"Role slugs read from PostgreSQL and cached in Redis for ≤ 60 s, then expanded into permissions through the in-process `DEFAULT_ROLE_GRANTS` table — `role_permissions` is seeded and parity-tested but not read at runtime"*, FUTURE *"`role_permissions` becomes the runtime source, making the grant matrix editable data rather than code"*, TRIGGER *"Tenant-defined custom roles (P2)"*. The future state was implemented ahead of its trigger, so the row now describes it as current and the remaining custom-role work is the separate *Role administration* row: what is missing is the API surface, not the resolution path.
 
 ---
 
@@ -363,7 +368,7 @@ Ordered steps, each gated by a measurable trigger. Do not pre-build them.
 | 9 | Partitioning (messages, events, usage) | Table > ~100 M rows or slow retention deletes |
 | 10 | Extract a service | Independent scaling/reliability/ownership need |
 
-One Phase 3 note for step 2: sessions are server-side but stored in PostgreSQL — shared by every replica, and held in no process-local state — so API replicas need no sticky sessions. Argon2id is CPU-bound by design and will show up in step 2's CPU trigger sooner than most endpoints — login cost is a deliberate purchase of resistance to offline cracking, and the correct response to that pressure is more API capacity, not cheaper hashing.
+One Phase 3 note for step 2: sessions are server-side but stored in PostgreSQL — shared by every replica, and held in no process-local state — so API replicas need no sticky sessions. The same is true of the permission cache: it lives in shared Redis, keyed by tenant and membership, so any replica reads and invalidates the same entry. Argon2id is CPU-bound by design and will show up in step 2's CPU trigger sooner than most endpoints — login cost is a deliberate purchase of resistance to offline cracking, and the correct response to that pressure is more API capacity, not cheaper hashing.
 
 ---
 
@@ -374,7 +379,7 @@ One Phase 3 note for step 2: sessions are server-side but stored in PostgreSQL �
 - Outbox dispatch budget: p95 < 1 s from commit to task publication.
 - AI context is bounded: recent turns + a rolling summary + top-K chunks — never the full history.
 - Batch embedding generation; cache embeddings by content hash.
-- Cache only non-authoritative, tenant-scoped data with short TTLs and explicit invalidation.
+- Cache only non-authoritative, tenant-scoped data with short TTLs and explicit invalidation. The effective-permission cache is the reference example: authoritative data stays in `role_permissions`, the cache key carries the tenant, the TTL is bounded, and mutations invalidate explicitly.
 - Never call an external provider inside a database transaction.
 - Bound every external call with a timeout, retry policy and circuit-breaking behaviour.
 - Track slow queries (`pg_stat_statements`) from the first production day.
@@ -399,7 +404,7 @@ One Phase 3 note for step 2: sessions are server-side but stored in PostgreSQL �
 12. Multiple AI agents/personas per tenant at launch?
 13. Expected message volume per tenant (capacity model input)?
 14. Are public comment replies held for approval by default?
-15. What must be visible in the audit log for launch? — *partially answered.* The identity half is settled and implemented: authentication outcomes, membership and role changes, and API-key lifecycle (`security.md` §10.1). The conversation, AI and billing half is still open.
+15. What must be visible in the audit log for launch? — *partially answered.* The identity half is settled and implemented: authentication outcomes, membership and role changes, and API-key lifecycle (`security.md` §10.1). The conversation, AI and billing half is still open. One item was added by the 2026-08-12 RBAC correction: `role_permissions` is now runtime-authoritative, so an edit to it changes who can do what and should be audited once an API can perform one.
 
 Question 6 acquired a dependency in Phase 3: the session and CSRF cookies use the `__Host-` prefix, which forbids a `Domain` attribute. The dashboard must therefore be served from the same origin as the API, or the cookie strategy has to be revisited before a split-origin frontend can work. This is a constraint to design around, not a defect — it is exactly the subdomain-injection protection the prefix exists to provide.
 
@@ -422,8 +427,9 @@ Question 6 acquired a dependency in Phase 3: the session and CSRF cookies use th
 | 11 | Module boundary erosion | Medium | Import rules in CI, review discipline, ADRs |
 | 12 | Malicious upload | Medium | Type/size validation, isolated storage, scanning, no execution path |
 | 13 | Credential stuffing against the login endpoint | High | Argon2id, per-account lockout; **per-address rate limiting is not yet implemented** and is required before public exposure |
+| 14 | Stale or cross-tenant permission cache entry grants access it should not | High | Tenant id is structural in the cache key; a malformed entry is treated as a miss rather than a grant; bounded TTL; explicit invalidation on mutation; covered by the RBAC resolution suite |
 
-Risk 1's mitigation is now partly built rather than planned: `TenantScopedRepository` makes an unscoped query on a tenant-owned table difficult to express by accident, and the identity integration suite asserts the negative cases directly. That covers the SQL surface for one module; Redis, object storage, retrieval and AI tools remain to be covered as those modules land.
+Risk 1's mitigation is now partly built rather than planned: `TenantScopedRepository` makes an unscoped query on a tenant-owned table difficult to express by accident, and the identity integration suite asserts the negative cases directly. That covers the SQL surface for one module, plus the Redis surface for the permission cache; object storage, retrieval and AI tools remain to be covered as those modules land.
 
 ---
 
@@ -431,7 +437,7 @@ Risk 1's mitigation is now partly built rather than planned: `TenantScopedReposi
 
 Kubernetes · Kafka/event streaming · Elasticsearch/OpenSearch · dedicated vector database · microservice extraction · database/schema per tenant · RLS timing · managed PostgreSQL/Redis vendor · external IdP · MFA mechanics · enterprise SSO/SCIM · visual-search model · data warehouse/BI · workflow engine (Temporal) · multi-region · data residency · ABAC/custom roles · CDN strategy.
 
-Still postponed after Phase 3. ADR-0009 and ADR-0015 were written so that adding an external IdP, MFA or SSO later changes only how a session is **established**, never how it is **validated** — which is what keeps these three cheap to defer. Custom roles are likewise deferred but not designed out: `roles.tenant_id` is nullable precisely so a tenant-owned role can be added without a schema change.
+Still postponed after Phase 3. ADR-0009 and ADR-0015 were written so that adding an external IdP, MFA or SSO later changes only how a session is **established**, never how it is **validated** — which is what keeps these three cheap to defer. Custom roles are likewise deferred but not designed out, and after the 2026-08-12 RBAC correction the remaining work is smaller than it was: `roles.tenant_id` is nullable so a tenant-owned role needs no schema change, and the resolver already reads whatever `role_permissions` contains, so such a role would be enforced without a code change. What is deferred is the API to create one, not the ability to honour it.
 
 ---
 
@@ -444,7 +450,7 @@ See `CURRENT_STATE.md` for live status. Reordering rationale is recorded below t
 | 0 ✅ | Architecture & documentation | This document set; ADR-0001–0012 |
 | 1 ✅ | Repository & application foundation | FastAPI shell, config, logging, OTel bootstrap, lint/type/test gates, health endpoints |
 | 2 ✅ | Config, Docker, PostgreSQL, Alembic, Redis, Celery | Local environment, migration workflow, worker + beat skeletons |
-| 3 ✅ | Identity | Users, auth sessions, tenants, memberships, RBAC, API keys, audit log; migration `0002_identity_access`; ADR-0015 |
+| 3 ✅ | Identity | Users, auth sessions, tenants, memberships, RBAC, API keys, audit log; migration `0002_identity_access`; ADR-0015. RBAC resolution corrected to be database-authoritative on 2026-08-12 |
 | 4 ◀ | **Event backbone** | `webhook_events`, `outbox_events`, dispatcher, `processed_events`, dead-letter, replay tooling |
 | 5 | Conversations | Contacts, conversations, messages, attachments, normalized model |
 | 6 | Channels & webhook ingestion | Provider abstraction, Meta adapters, signature verification, ingestion on the outbox |
@@ -460,7 +466,7 @@ See `CURRENT_STATE.md` for live status. Reordering rationale is recorded below t
 | 16 | Visual product search | Image embeddings, tenant-scoped similarity |
 | 17 | Load & security testing, hardening | Load tests, isolation/pen tests, restore rehearsal, readiness checklist |
 
-**Phase 4 has not been started.** It is the next phase and requires explicit approval before work begins.
+**Phase 4 has not been started.** It is the next phase and requires explicit approval before work begins. The 2026-08-12 RBAC correction is Phase 3 work and creates none of Phase 4's tables, dispatchers or replay tooling.
 
 **Why this differs from the original ordering**
 
@@ -471,3 +477,5 @@ See `CURRENT_STATE.md` for live status. Reordering rationale is recorded below t
 5. **Crawler and visual search moved after launch readiness** — neither is launch-critical, and the crawler carries the highest security cost in the system.
 
 **Phase 3 in retrospect.** Identity landed before the event backbone, which was the right order: `audit_logs` needs an actor, and every module after this one needs a `TenantContext` to scope against. It also means the outbox arrives into a codebase where tenant scoping and authorisation already exist, so event payloads can carry a tenant id that something is prepared to verify. The one thing Phase 3 deferred that Phase 4 will want is a rate limiter — webhook endpoints need one, and it should be built as shared infrastructure rather than an events-module detail.
+
+One lesson from the RBAC correction is worth carrying into Phase 4: the original implementation shipped tables that looked authoritative and were not, with a parity test that made the discrepancy invisible. Phase 4 has the same shape of risk — `webhook_events` and `outbox_events` will look durable whether or not the dispatcher actually reads them — so its tests must assert against the database state that is supposed to drive behaviour, not against the code path that happens to produce it.

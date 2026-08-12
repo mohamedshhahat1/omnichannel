@@ -35,7 +35,10 @@ from app.modules.identity.repositories import MembershipRepository, SessionRepos
 from app.modules.identity.services.api_keys import ApiKeyService
 from app.modules.identity.services.audit import AuditService
 from app.modules.identity.services.authentication import AuthenticationService, SessionIdentity
-from app.modules.identity.services.permissions import PermissionResolver, RoleSlugCache
+from app.modules.identity.services.permissions import (
+    EffectivePermissionCache,
+    PermissionResolver,
+)
 from app.modules.identity.services.provisioning import ProvisioningService
 from app.modules.identity.services.sessions import SessionService
 
@@ -59,22 +62,30 @@ def provide_password_hashing(request: Request) -> PasswordHashingService:
 PasswordHashingDep = Annotated[PasswordHashingService, Depends(provide_password_hashing)]
 
 
-def provide_role_slug_cache(request: Request, settings: SettingsDep) -> RoleSlugCache:
+def provide_effective_permission_cache(
+    request: Request,
+    settings: SettingsDep,
+) -> EffectivePermissionCache:
     """Return the RBAC cache, disabled when Redis is not attached.
 
     Resolved defensively rather than through `provide_redis`: the test
     application deliberately starts no infrastructure, and authorization must
     keep working there - from PostgreSQL alone - instead of failing with a 500.
+    That fallback is also the honest statement of the design: Redis holds a
+    copy, PostgreSQL holds the answer.
     """
     client = getattr(request.app.state, "redis", None)
-    return RoleSlugCache(
+    return EffectivePermissionCache(
         client if isinstance(client, Redis) else None,
         environment=settings.environment.value,
         ttl_seconds=settings.auth.session_cache_ttl_seconds,
     )
 
 
-RoleSlugCacheDep = Annotated[RoleSlugCache, Depends(provide_role_slug_cache)]
+EffectivePermissionCacheDep = Annotated[
+    EffectivePermissionCache,
+    Depends(provide_effective_permission_cache),
+]
 
 
 def provide_audit_service(session: DatabaseSessionDep) -> AuditService:
@@ -107,7 +118,7 @@ def provide_authentication_service(
     passwords: PasswordHashingDep,
     sessions: SessionServiceDep,
     api_keys: ApiKeyServiceDep,
-    cache: RoleSlugCacheDep,
+    cache: EffectivePermissionCacheDep,
     audit: AuditServiceDep,
 ) -> AuthenticationService:
     """Return the credential-verification service."""
@@ -232,7 +243,7 @@ PrincipalDep = Annotated[Principal, Depends(provide_principal)]
 def build_permission_resolver(
     session: DatabaseSessionDep,
     principal: PrincipalDep,
-    cache: RoleSlugCacheDep,
+    cache: EffectivePermissionCacheDep,
 ) -> PermissionResolver:
     """Return a resolver scoped to the caller's tenant."""
     return PermissionResolver(MembershipRepository(session, principal.tenant), cache)

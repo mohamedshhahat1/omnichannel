@@ -51,7 +51,10 @@ from app.modules.identity.repositories import (
 from app.modules.identity.services.api_keys import ApiKeyService, resolve_scopes
 from app.modules.identity.services.audit import AuditService
 from app.modules.identity.services.authentication import AuthenticationService
-from app.modules.identity.services.permissions import PermissionResolver, RoleSlugCache
+from app.modules.identity.services.permissions import (
+    EffectivePermissionCache,
+    PermissionResolver,
+)
 from app.modules.identity.services.sessions import SessionService
 from app.platform.clock import utcnow
 
@@ -153,7 +156,7 @@ async def _create_workspace(
     assert role_record is not None, "system roles must be seeded by migration 0002"
     await memberships.assign_role(membership_id=membership.id, role_id=role_record.id)
 
-    cache = RoleSlugCache(None, environment="test", ttl_seconds=0)
+    cache = EffectivePermissionCache(None, environment="test", ttl_seconds=0)
     resolver = PermissionResolver(memberships, cache)
     slugs = await resolver.role_slugs_for(membership.id)
     principal = Principal(
@@ -211,8 +214,10 @@ async def test_the_system_roles_are_seeded(db_session: AsyncSession) -> None:
 
 @pytest.mark.parametrize("role", list(RoleSlug))
 async def test_seeded_grants_match_the_domain(db_session: AsyncSession, role: RoleSlug) -> None:
-    # The database is the thing that actually authorises requests. If the seed
-    # and the domain table disagree, the domain table is a comforting fiction.
+    # The database is the thing that actually authorises requests, and
+    # `DEFAULT_ROLE_GRANTS` is what seeded it. This pins the two together in
+    # the one direction that remains valid: Python defaults -> initial seed.
+    # It is not evidence that the constant is consulted at runtime; it is not.
     rows = await db_session.execute(
         text(
             "SELECT p.slug FROM role_permissions rp "
@@ -347,6 +352,10 @@ async def test_role_assignment_produces_the_documented_permissions(
     db_session: AsyncSession,
     passwords: PasswordHashingService,
 ) -> None:
+    # Resolved from `role_permissions`. This matches `DEFAULT_ROLE_GRANTS`
+    # because the constant seeded those rows, not because runtime
+    # authorization reads it - see tests/integration/test_identity_rbac_resolution.py,
+    # which mutates the rows and watches the answer follow the database.
     workspace = await _create_workspace(db_session, passwords, role=RoleSlug.AGENT)
     assert workspace.principal.role_slugs == frozenset({"agent"})
     assert workspace.principal.permissions == DEFAULT_ROLE_GRANTS[RoleSlug.AGENT]
@@ -630,6 +639,10 @@ async def test_an_expired_key_does_not_authenticate(
         text("UPDATE api_keys SET expires_at = :past WHERE id = :id"),
         {"past": utcnow() - timedelta(seconds=1), "id": issued.record.id},
     )
+    # The raw UPDATE bypasses the ORM, so the identity map still holds the
+    # original future expires_at. Expire the row to force authenticate() to
+    # reload the mutated value instead of the cached one.
+    db_session.expire(issued.record)
     assert await service.authenticate(issued.plaintext) is None
 
 
@@ -715,7 +728,7 @@ def _authentication(
         passwords=passwords,
         sessions=SessionService(SessionRepository(session), resolved),
         api_keys=ApiKeyService(session, settings=resolved, environment=Environment.TEST),
-        cache=RoleSlugCache(None, environment="test", ttl_seconds=0),
+        cache=EffectivePermissionCache(None, environment="test", ttl_seconds=0),
         audit=AuditService(session),
     )
 

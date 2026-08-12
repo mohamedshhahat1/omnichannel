@@ -26,7 +26,11 @@ NAMING_CONVENTION = {
 
 
 class Base(DeclarativeBase):
-    """Declarative base for future module-owned models; Phase 2 adds no models."""
+    """Declarative base shared by module-owned models.
+
+    The identity module registers its tables on this metadata, so Alembic
+    autogenerate and Base.metadata see the full schema.
+    """
 
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 

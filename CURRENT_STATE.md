@@ -16,7 +16,7 @@
 | Infrastructure foundation (PostgreSQL, Redis, Celery, Alembic, Docker) | ✅ Complete (Phase 2) |
 | Business modules | ⚠️ `identity` only (Phase 3). Every other module in `app/modules/` is still unstarted |
 | Database models | ⚠️ Identity entities only (Phase 3). Conversation, channel, event, catalog and billing tables are Phase 4+ |
-| Authentication / RBAC | ✅ Complete (Phase 3) |
+| Authentication / RBAC | ✅ Complete (Phase 3), with the 2026-08-12 RBAC correction written but not yet executed — see §3 |
 | CI/CD | ✅ GitHub Actions pipeline (Ruff lint, Ruff format, MyPy, unit + integration Pytest on real PostgreSQL/Redis, Docker build, Compose validation) |
 | Infrastructure | ⚠️ Local development topology only; no production services provisioned |
 
@@ -93,22 +93,24 @@ Delivered in `backend/`. Additive only: no Phase 0–2 architecture, lifecycle, 
 
 | Area | What exists |
 |---|---|
-| Domain rules | `app/modules/identity/domain.py` — the 15-permission catalogue, six system roles and their grants, `Principal` / `TenantContext`, e-mail / slug / display-name normalisation, password policy |
+| Domain rules | `app/modules/identity/domain.py` — the 15-permission catalogue, six system roles and their default grants, `Principal` / `TenantContext`, e-mail / slug / display-name normalisation, password policy |
 | Credential primitives | `app/core/security.py` — Argon2id hashing with rehash detection, 256-bit opaque token generation, SHA-256 digesting, constant-time comparison, API-key minting and parsing |
 | Configuration | `app/core/settings.py` — new `AuthSettings` section; production floors (Argon2 cost, `__Host-` cookie prefix, `Secure`) enforced by the existing hardening validator |
 | Tables | `app/modules/identity/models.py` — `tenants`, `users`, `memberships`, `roles`, `permissions`, `role_permissions`, `membership_roles`, `sessions`, `api_keys`, `email_tokens`, `audit_logs` |
 | Repositories | `app/modules/identity/repositories.py` — `TenantScopedRepository` base; tenant scoping is structural rather than a filter each caller must remember |
-| Services | `app/modules/identity/services/` — authentication, sessions, API keys, RBAC resolution with a Redis role cache, provisioning, audit, authorisation helpers, input validation |
+| Services | `app/modules/identity/services/` — authentication, sessions, API keys, RBAC resolution from `role_permissions` behind a Redis effective-permission cache, provisioning, audit, authorisation helpers, input validation |
 | HTTP surface | `app/modules/identity/api/` — 13 endpoints under `/api/v1`, FastAPI dependency providers, response schemas built field by field so no ORM attribute can leak |
 | Migration | `alembic/versions/20260812_0100_0002_identity_and_access.py` — revision `0002_identity_access`, down revision `0001_initial_infra`; creates the eleven tables and seeds the permission catalogue and system roles |
 | Errors | `app/modules/identity/errors.py` — eleven domain errors mapped onto the existing ADR-0013 envelope |
-| Tests | 5 unit modules and 2 integration modules; roughly 71 new identity tests |
+| Tests | 5 unit modules and 3 integration modules; roughly 71 identity tests plus the RBAC resolution suite added on 2026-08-12 |
 
-One new decision was recorded: **ADR-0015 — Identity, tenancy and credential handling**.
+One new decision was recorded: **ADR-0015 — Identity, tenancy and credential handling**, with a dated correction note covering the RBAC change below.
 
 **Authentication.** Passwords are Argon2id only; the plaintext is never stored, logged, traced or echoed in an error. Sessions are opaque 256-bit tokens delivered in an `HttpOnly` cookie; only the SHA-256 digest is persisted, so a database disclosure yields no usable session. Unknown address, wrong password and malformed address produce an identical 401, and registration returns an identical 202 whether or not the address is already taken — neither endpoint is an account-existence oracle. Repeated failures lock the account for a configured interval, after which even the correct password is refused. Sessions carry both an idle and an absolute expiry, and a `session_epoch` on the user invalidates every outstanding session at once.
 
-**Authorisation.** Six system roles resolve to a fixed permission set, seeded by the migration and asserted against the domain table by an integration test — if the two ever disagree, the test fails rather than the database silently winning. Permission checks raise the existing taxonomy: 403 for a member who lacks a permission, 404 when there is no membership at all. Role changes take effect on the next request, not whenever the session happens to expire.
+**Authorisation.** Effective permissions are resolved from PostgreSQL: `membership_roles → roles → role_permissions → permissions`. **`role_permissions` is the runtime RBAC source of truth.** `DEFAULT_ROLE_GRANTS` in `identity/domain.py` defines the initial/default system-role grant matrix used for seeding, reference and testing, and is not consulted during runtime authorization — an integration test still asserts the seeded rows match it, pinning the Python-defaults-to-seed direction. Permission checks raise the existing taxonomy: 403 for a member who lacks a permission, 404 when there is no membership at all. Role changes take effect on the next request, not whenever the session happens to expire.
+
+> **Corrected 2026-08-12.** This paragraph previously read "Six system roles resolve to a fixed permission set, seeded by the migration and asserted against the domain table by an integration test — if the two ever disagree, the test fails rather than the database silently winning." That described the delivered Phase 3 behaviour accurately: the Python constant was the operative matrix and the database rows were a verified copy. The implementation has since been corrected so the database rows are operative. See `docs/security.md` §3.2 and the ADR-0015 correction note.
 
 **Tenancy.** Every tenant-scoped read and write goes through a repository constructed with a `TenantContext`, so "forgot the tenant filter" is not something a caller can express. A real, active membership in another tenant resolves to `None` through this tenant's repository, by id and by user, and never appears in a listing. Cross-tenant access to an object that exists is reported as 404, never 403, so an identifier cannot be probed. Signing in against a tenant you do not belong to yields a session with no principal rather than an error, making "no such workspace" and "not your workspace" indistinguishable.
 
@@ -120,15 +122,17 @@ One new decision was recorded: **ADR-0015 — Identity, tenancy and credential h
 
 ## 3. Current phase
 
-**Phase 3 — Identity and access: implemented, tested locally where possible, documented and pushed to `phase-2-infrastructure`. Awaiting human CI verification.**
+**Phase 3 — Identity and access: implemented, documented and pushed to `phase-2-infrastructure`. Awaiting human CI verification.**
 
-CI/CD was not accessed by any automated agent. Phase 4 must not begin until the operator confirms CI is green and explicitly approves.
+**RBAC correction (2026-08-12), on the branch `fix/rbac-database-authoritative`, not merged.** Runtime authorization now resolves effective permissions from PostgreSQL `role_permissions` rather than from the Python `DEFAULT_ROLE_GRANTS` constant. The branch contains implementation, tests and documentation changes only.
+
+Neither the Phase 3 commits nor the RBAC correction has been executed anywhere. The authoring environment for the correction had no shell, no Python interpreter, no PostgreSQL, no Redis and no Docker daemon, so `pytest`, `ruff`, `mypy` and Alembic could not be run against it — see §7. CI/CD was not accessed by any automated agent. Phase 4 must not begin until the operator confirms CI is green and explicitly approves.
 
 ---
 
 ## 4. Current task
 
-None in progress. The human operator runs and observes GitHub Actions.
+None in progress. The human operator runs and observes GitHub Actions, and decides whether to merge `fix/rbac-database-authoritative` into `phase-2-infrastructure`.
 
 ---
 
@@ -173,7 +177,7 @@ Identity endpoints, all under `/api/v1`:
 | POST | `/auth/logout` | Revoke this session |
 | POST | `/auth/logout-all` | Revoke every session for the user |
 | POST | `/tenants` | Create an additional tenant |
-| GET | `/roles` | The role catalogue |
+| GET | `/roles` | The role catalogue, with each role's grants read from `role_permissions` |
 | GET | `/members` | List members of the current tenant |
 | POST | `/members` | Invite a member with a role |
 | POST | `/members/{membership_id}/roles` | Assign a role |
@@ -194,16 +198,17 @@ mypy
 python -m compileall app tests alembic
 ```
 
-Integration tests are opt-in and require `OC_TEST_DATABASE_URL` (real PostgreSQL via `asyncpg`) and `OC_TEST_REDIS_URL`.
+Integration tests are opt-in and require `OC_TEST_DATABASE_URL` (real PostgreSQL via `asyncpg`) and `OC_TEST_REDIS_URL`. The RBAC resolution suite needs **both**: its four caching and tenant-isolation tests skip without Redis, and skipping them removes exactly the evidence that the permission cache is safe.
 
 ---
 
 ## 7. Known issues
 
 - **Phase 3 quality gates were only partially executable in the authoring environment.** That environment has no network and no third-party packages installed, so `pytest`, `ruff check .`, `ruff format --check .`, `mypy`, `alembic` and Docker **could not be run** and must not be assumed to pass. What was executed locally: byte-compilation and AST parsing of all 33 Phase 3 files, a >100-character line scan, a trailing-whitespace and tab scan, a trailing-newline check, a relative-import (TID252) scan, a credential-literal scan, an AST-based unused-import approximation, and a tokenizer-based approximation of `ruff format`'s string-quote normalisation. Those scans caught and fixed three real defects that would otherwise have failed CI (an unused `MembershipRepository` import, and two single-quoted strings `ruff format` would rewrite). Reading the integration suite back also caught a fourth: it drove the app with a synchronous test client, which would have handed an asyncpg connection to a second event loop. The authoritative verdict for every gate is CI.
+- **The 2026-08-12 RBAC correction was authored with even less available.** That environment had no shell at all: no working tree, no `git` binary, no Python interpreter, no PostgreSQL, no Redis, no Docker. Not one check was run against it — not even byte-compilation. `pytest`, `ruff check .`, `ruff format --check .`, `mypy`, `python -m compileall` and `alembic` were all unrunnable for the same reason, and `git status` and `git diff` were replaced by reading the pushed commits back through the GitHub API. The change touches the authorization path, so it should be treated as unverified until CI says otherwise.
 - **CI verifies all quality gates** (Ruff lint, Ruff format, MyPy, unit + integration Pytest, Docker build, Compose validation). However, the initial offline-authored `requirements.lock` is still a direct-pin set only: CI installs from it as documented, and transitive dependencies float until the lock is regenerated with a networked resolver (P0). Phase 3 added `argon2-cffi` to it under the same limitation.
 - `backend/requirements.lock` is intentionally **not** a fully resolved production lock. It is a temporary offline-authored direct dependency pin set with no fabricated hashes or transitive claims. Regenerate it in CI or another networked environment.
-- **Identity limitations carried forward.** `email_tokens` exists and is migrated, but no delivery mechanism is wired, so e-mail verification and password reset are modelled and not yet usable. There is no per-endpoint rate limiting yet — only per-account lockout — so login is throttled per identity but not per source address. There is no MFA, no SSO and no custom roles; all three are explicitly P2.
+- **Identity limitations carried forward.** `email_tokens` exists and is migrated, but no delivery mechanism is wired, so e-mail verification and password reset are modelled and not yet usable. There is no per-endpoint rate limiting yet — only per-account lockout — so login is throttled per identity but not per source address. There is no MFA, no SSO and no custom roles; all three are explicitly P2. There is no API for editing roles or `role_permissions`: the rows are now runtime-authoritative but only a migration writes them.
 - Several architectural inputs remain unanswered; see the Open Questions section of `docs/architecture.md`. The most blocking are which channel launches first, whether AI replies auto-send at launch, the first AI provider/model, the initial plan matrix, and the production hosting and object storage providers.
 
 ---
@@ -218,7 +223,8 @@ Integration tests are opt-in and require `OC_TEST_DATABASE_URL` (real PostgreSQL
 | Polling outbox dispatcher (no LISTEN/NOTIFY) | Simple, predictable, easy to reason about | Dispatch latency budget < 1 s becomes a product requirement |
 | `app/platform` shadows the stdlib `platform` module, `app/core/logging.py` shadows stdlib `logging` | Safe under Python 3 absolute imports; the names match the approved architecture and are worth more than the theoretical risk | Only if a dependency performs implicit relative imports (it will not) |
 | Offline-authored dependency pin set | No resolver/network access in the authoring environment | Regenerated and validated in CI or another networked environment |
-| Redis role-slug cache introduces a staleness window | A permission change becomes visible after at most `session_cache_ttl_seconds` (default 60 s); the alternative is a join on every authenticated request | Permission changes must take effect instantly, or the cache is shown to be unnecessary |
+| Redis effective-permission cache introduces a staleness window | A grant edited directly in the database, outside the service layer, becomes visible after at most `session_cache_ttl_seconds` (default 60 s). Mutations made through the application invalidate the entry immediately; the alternative is a join on every authenticated request | Permission changes must take effect instantly even for out-of-band SQL, or the cache is shown to be unnecessary |
+| No API for role or `role_permissions` mutation | `role_permissions` is now runtime-authoritative, but only migration `0002_identity_access` writes it. The invalidation hook exists and is called on role assignment, so exposing an API is wiring rather than redesign | Role management is offered to tenant administrators (P1) |
 | `email_tokens` modelled without a delivery path | The table and lifecycle belong with the identity schema; the transport is a separate concern | E-mail verification or password reset becomes a product requirement |
 | Login throttled per account, not per source address | Per-account lockout is the control that protects the account; per-address limiting needs the shared rate limiter that does not exist yet | The rate limiting work in P1 is picked up |
 | Plain `text` e-mail column with a lowercase CHECK rather than `citext` | Keeps the extension surface small and the constraint explicit and portable; normalisation happens in the application and is enforced by the database | Case-insensitive matching is needed somewhere the CHECK cannot cover |
@@ -243,3 +249,4 @@ Carry these forward into every implementation session:
 12. Authorisation happens in the service layer through `services/authorization.py`, not in the route. A missing permission is 403; a missing membership is 404.
 13. Anything that lets a caller distinguish "exists but is not yours" from "does not exist" is a bug. Cross-tenant access to a real object returns 404.
 14. Credential material is stored as a one-way digest and returned to a caller exactly once, at creation. Never add it to a response schema, a log line, an audit context or an exception message.
+15. **`DEFAULT_ROLE_GRANTS` seeds the database; it never answers an authorization question.** Effective permissions come from `role_permissions` through `PermissionResolver`. If you add a code path that mutates a role, a role's grants or a membership's roles, it must call `PermissionResolver.invalidate` for every affected membership.

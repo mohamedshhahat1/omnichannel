@@ -108,7 +108,7 @@ class AuditOutcome(StrEnum):
     FAILURE = "failure"
 
 
-_ALL_PERMISSIONS: Final = frozenset(Permission)
+_ALL_PERMISSIONS: Final[frozenset[Permission]] = frozenset(Permission)
 
 _CONVERSATION_WORK: Final = frozenset(
     {

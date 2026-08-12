@@ -5,6 +5,8 @@
 > **Phase 2 status:** the repository now includes the local PostgreSQL/Redis/Celery topology, least-privileged local PostgreSQL roles, readiness checks, and migration bootstrap. Production backup automation, WAL archiving, monitoring-backed alerts, and restore rehearsal remain future operational work.
 >
 > **Phase 3 status:** Phase 3 (identity and access) added **no new operational infrastructure** — no scheduled job, no daemon, no new service, no new deployment secret. What it added is a set of operator procedures that previously had nothing to act on: account lockout and manual unlock, forced sign-out via the session epoch, API-key revocation and rotation, and an access review that can now actually be performed. Those are §2.11–§2.14. It also introduced two acknowledged gaps — there is no session-reaper job and no audit-log retention job (§3) — and one hard limitation: there is no e-mail transport, so password reset and e-mail verification cannot be driven end to end (§2.14).
+>
+> **RBAC correction 2026-08-12.** Runtime authorization now reads `role_permissions` from PostgreSQL instead of expanding role slugs through a Python constant. This adds no infrastructure either, but it changes two operational facts: editing a grant in the database now changes behaviour, and the Redis entry described in §1.3 and §2.12 holds effective permissions rather than role slugs. The operator advice in §2.12 is unchanged — it was already correct.
 
 ---
 
@@ -42,7 +44,9 @@ If Redis is lost entirely: queued Celery tasks disappear, caches go cold, rate-l
 
 This is one of the strongest practical arguments for the transactional outbox (ADR-0003) and it directly simplifies the DR plan.
 
-**Phase 3 note.** Losing Redis does not sign anyone out. Sessions and API keys are authoritative in PostgreSQL and are **not cached at all** — every authenticated request reads the row. Redis holds only a short-lived read cache of **role assignments** (`OC_AUTH__SESSION_CACHE_TTL_SECONDS`, default 60 s — the setting is named for the auth path it sits on, not because sessions are cached). With Redis gone, identity degrades to PostgreSQL-only — slightly more database load per request, and the role-cache staleness window in §2.12 disappears entirely.
+**Phase 3 note, corrected 2026-08-12.** Losing Redis does not sign anyone out, and it does not deny anyone access. Sessions and API keys are authoritative in PostgreSQL and are **not cached at all** — every authenticated request reads the row. Redis holds only a short-lived read cache of a membership's **effective permission set** (`OC_AUTH__SESSION_CACHE_TTL_SECONDS`, default 60 s — the setting is named for the auth path it sits on, not because sessions are cached). With Redis gone, identity degrades to PostgreSQL-only: one extra join per authenticated request, and the staleness window in §2.12 disappears entirely. Nothing fails closed incorrectly, because a cache miss is answered from `role_permissions`, not from an empty set.
+
+> The earlier wording of this note said Redis holds "a short-lived read cache of **role assignments**". That was accurate before the 2026-08-12 RBAC correction; the cache now holds the resolved permission set.
 
 ### 1.4 What must be recovered
 
@@ -55,7 +59,7 @@ This is one of the strongest practical arguments for the transactional outbox (A
 | Infrastructure definition | Git repository | Compose files, NGINX config, scripts |
 | Redis | Not backed up | See §1.3 |
 
-**Phase 3 note.** All identity data — users, tenants, memberships, roles, permissions, sessions, API keys, e-mail tokens and audit logs — lives entirely in PostgreSQL and is therefore covered by the first row. There is no separate identity store, no external identity provider, and no credential material held outside the database, so identity adds no new row to this table.
+**Phase 3 note.** All identity data — users, tenants, memberships, roles, permissions, sessions, API keys, e-mail tokens and audit logs — lives entirely in PostgreSQL and is therefore covered by the first row. There is no separate identity store, no external identity provider, and no credential material held outside the database, so identity adds no new row to this table. The 2026-08-12 RBAC correction reinforces this rather than changing it: the authorisation decision itself is now recoverable from the same backup as everything else, because `role_permissions` is where it lives.
 
 ### 1.5 Restore runbook (target < 4 hours)
 
@@ -70,7 +74,7 @@ This is one of the strongest practical arguments for the transactional outbox (A
 9. **Reconcile:** replay provider events for the gap where possible; run the billing reconciliation sweep; identify conversations affected by the recovery-point gap.
 10. **Post-incident review** with corrective actions recorded in `TODO.md`.
 
-**Phase 3 addition to step 5 (verify data).** Add these to the spot-check list — a restore that silently lost the seeded reference data will authenticate users successfully and then deny every single one of them, which is a confusing failure to diagnose under pressure:
+**Phase 3 addition to step 5 (verify data).** Add these to the spot-check list — a restore that silently lost the seeded reference data will authenticate users successfully and then deny every single one of them, which is a confusing failure to diagnose under pressure. Since the 2026-08-12 RBAC correction the last query is the one that matters most: `role_permissions` is what authorises requests, so a restore with roles but no grants produces exactly that symptom.
 
 ```sql
 SELECT count(*) FROM users;
@@ -83,7 +87,7 @@ SELECT count(*) FROM role_permissions;            -- grants must be present, not
 
 **Phase 3 addition to step 6 (run migrations).** `alembic upgrade head` now applies `0002_identity_access` as well as `0001_initial_infra`, and `0002` seeds the reference data above. Restoring from a dump means that data is already present and the migration is a no-op. Rebuilding from migrations into an *empty* database recreates only the reference data — permissions, system roles and grants — and **not** tenants, users, memberships, sessions or API keys, which exist only in the dump. Migrations are never run automatically from application startup (ADR-0004); this step is deliberate and manual.
 
-**Phase 3 note on the recovery-point gap (step 9).** Sessions created after the recovery point are gone, so the affected users are simply signed out and sign in again — no action needed. API keys issued after the recovery point are also gone, and those *do* need action: the plaintext was shown once at creation and cannot be recovered, so affected tenants must be told to issue new keys. Include "API keys created after the recovery point" in the reconciliation list alongside conversations.
+**Phase 3 note on the recovery-point gap (step 9).** Sessions created after the recovery point are gone, so the affected users are simply signed out and sign in again — no action needed. API keys issued after the recovery point are also gone, and those *do* need action: the plaintext was shown once at creation and cannot be recovered, so affected tenants must be told to issue new keys. Include "API keys created after the recovery point" in the reconciliation list alongside conversations. Add role assignments made after the recovery point to the same list: they are authorisation state, they are lost with everything else, and unlike a session nobody notices by being signed out — they notice by being denied.
 
 ### 1.6 Future improvements (post-launch)
 
@@ -115,7 +119,7 @@ Every alert links to one of these. An alert without a runbook is deleted or writ
 **Actions:** fix the cause → reset the affected rows to `pending` with `attempts = 0` via the replay tool → confirm consumers are idempotent → verify effects were applied exactly once → record the incident.
 
 ### 2.3 Redis down or lost
-**Actions:** restart Redis; restart workers; confirm the outbox drains; expect a cold cache and reset rate limits. Verify no duplicate customer messages were sent (delivery attempt records and provider idempotency keys protect this).
+**Actions:** restart Redis; restart workers; confirm the outbox drains; expect a cold cache and reset rate limits. Verify no duplicate customer messages were sent (delivery attempt records and provider idempotency keys protect this). Authentication and authorisation continue working throughout — see §1.3.
 
 ### 2.4 PostgreSQL unavailable
 **Actions:** confirm the container/host state, disk space, and connection saturation; the API should be failing readiness and NGINX returning a maintenance response; if the data is intact, restart and verify; if not, execute §1.5. Communicate status to tenants.
@@ -132,7 +136,7 @@ Every alert links to one of these. An alert without a runbook is deleted or writ
 ### 2.8 Suspected cross-tenant data exposure
 **Treat as a security incident.** Preserve evidence; identify scope via audit logs and `correlation_id`; contain (disable the endpoint/feature, revoke sessions/keys); notify per policy; write a regression test that reproduces it before shipping the fix.
 
-**Phase 3 — how to actually contain and investigate.** "Revoke sessions/keys" is now a concrete operation: §2.12 for sessions, §2.13 for API keys. `audit_logs` is the evidence source and stores `correlation_id`, `request_id`, `tenant_id`, actor type, actor id, action and outcome for every identity action, so scope can be reconstructed from the correlation id outward. Preserve it — there is no retention job (§3), so nothing will quietly delete it during an investigation. The regression test belongs in `backend/tests/integration/test_identity_persistence.py`, which already contains the cross-tenant denial cases to copy from.
+**Phase 3 — how to actually contain and investigate.** "Revoke sessions/keys" is now a concrete operation: §2.12 for sessions, §2.13 for API keys. `audit_logs` is the evidence source and stores `correlation_id`, `request_id`, `tenant_id`, actor type, actor id, action and outcome for every identity action, so scope can be reconstructed from the correlation id outward. Preserve it — there is no retention job (§3), so nothing will quietly delete it during an investigation. The regression test belongs in `backend/tests/integration/test_identity_persistence.py`, which already contains the cross-tenant denial cases to copy from — or in `test_identity_rbac_resolution.py` if the exposure involves permissions rather than rows.
 
 ### 2.9 Disk pressure
 **Check:** database growth, WAL accumulation (is archiving failing?), logs, crawler artifacts, orphaned media.
@@ -189,13 +193,23 @@ UPDATE sessions SET revoked_at = now() WHERE user_id = :user_id AND revoked_at I
 UPDATE users SET session_epoch = session_epoch + 1 WHERE id = :user_id;
 ```
 
-> **Corrected 2026-08-12 (Phase 0–3 audit).** An earlier version of this runbook said session lookups are cached in Redis and that revoking a row could leave a cached session usable for up to a minute. **That was wrong.** There is no session cache: `SessionService.find_live()` reads PostgreSQL on every authenticated request, so `revoked_at` takes effect immediately. `app/modules/identity/services/permissions.py` says the same thing in its own docstring — "sessions themselves stay in PostgreSQL (ADR-0009)". Believing in a revocation window that does not exist would waste time during exactly the incident this runbook exists for.
+> **Corrected 2026-08-12 (Phase 0–3 audit).** An earlier version of this runbook said session lookups are cached in Redis and that revoking a row could leave a cached session usable for up to a minute. **That was wrong.** There is no session cache: `SessionService.find_live()` reads PostgreSQL on every authenticated request, so `revoked_at` takes effect immediately. Believing in a revocation window that does not exist would waste time during exactly the incident this runbook exists for.
 
 **Why the epoch bump is still not optional.** The `UPDATE sessions` statement only revokes rows that existed at the moment it ran. A session issued a fraction of a second later — by an attacker who still holds the password, or by a login racing your sweep — is untouched by it. `users.session_epoch` is a single value compared against `sessions.user_epoch` on every authenticated request, so incrementing it invalidates **everything issued before that instant** without depending on your row sweep having been complete. Do both statements: the first closes the sessions you can see, the second closes the ones you could not enumerate.
 
 **What the epoch does not do.** It does not prevent a *new* sign-in. Anyone who still knows the password can authenticate immediately afterwards and receive a session carrying the new epoch. If the credential itself is suspect, the epoch bump is containment, not a fix — pair it with the suspension below and with §2.14 to reset the password.
 
-**Role and permission changes behave differently — know the difference.** This is where the cache actually is. A membership's **role slugs** are cached in Redis for `session_cache_ttl_seconds` (default 60 s, max 300 s) and expanded into permissions in process, and the cache is **not** covered by the epoch — so removing a role or downgrading a membership can take up to that long to take effect. Role changes made through the API (`POST /api/v1/members/{membership_id}/roles`) invalidate the cached entry explicitly, so in practice the window applies to changes made directly in the database. It is a bounded staleness window, not a revocation hole: if access must stop *now*, revoke the session and bump the epoch rather than waiting for the role cache to expire. If Redis is unavailable the cache degrades to PostgreSQL-only and the window disappears entirely.
+**Role and permission changes behave differently — know the difference.** This is where the cache actually is. A membership's **effective permission set** — resolved from `role_permissions` in PostgreSQL — is cached in Redis for `session_cache_ttl_seconds` (default 60 s, max 300 s), and the cache is **not** covered by the epoch. Removing a role, downgrading a membership or editing a role's grants can therefore take up to that long to take effect. Changes made through the API (`POST /api/v1/members/{membership_id}/roles`) invalidate the entry explicitly, so in practice the window applies only to changes made **directly in the database**, outside the service layer. It is a bounded staleness window, not a revocation hole: if access must stop *now*, revoke the session and bump the epoch rather than waiting for the permission cache to expire. If Redis is unavailable the cache degrades to PostgreSQL-only and the window disappears entirely.
+
+> **Corrected 2026-08-12 (RBAC correction).** This paragraph previously said a membership's **role slugs** are cached and "expanded into permissions in process". Since the RBAC correction the cached value is the resolved permission set itself, and `role_permissions` is the runtime source of truth. The operator guidance is unchanged — the window, its bound, the explicit invalidation on role assignment and the advice to revoke rather than wait were all already correct. What changed is that editing a grant directly in the database now *does* eventually take effect, where before it never did.
+
+**To drop a membership's cached permissions immediately** after an out-of-band database edit, delete the key rather than waiting out the TTL:
+
+```
+DEL oc:{env}:t:{tenant_id}:rbac-perms:{membership_id}
+```
+
+Deleting it is always safe: a miss is answered from PostgreSQL.
 
 **Suspending rather than signing out:** setting `users.status` to `suspended`, or a membership's `status` to `suspended`, blocks future authentication and authorisation but does not itself kill live sessions. Pair it with the two statements above.
 
@@ -217,7 +231,7 @@ FROM api_keys WHERE key_id = :key_id;
 UPDATE api_keys SET revoked_at = now() WHERE id = :api_key_id;
 ```
 
-Revocation takes effect immediately: API-key authentication reads the database on every request and is not cached, so there is no staleness window of the kind sessions have.
+Revocation takes effect immediately: API-key authentication reads the database on every request and is not cached, so there is no staleness window of the kind the permission cache has.
 
 **Rotate with zero downtime.** Issue the new key → deploy it to the consumer → confirm `last_used_at` is advancing on the new key and static on the old → revoke the old. There is deliberately **no update path**: a key is never edited in place, because rotating in place would mean handling plaintext twice.
 
@@ -275,6 +289,19 @@ ORDER BY last_used_at NULLS FIRST;
 
 Pay particular attention to `owner` assignments — owner is the only role that can mint another owner, and it is the only role holding `billing.manage` in addition to everything else. A key with a null or ancient `last_used_at` is a revocation candidate, not a mystery to leave alone.
 
+**Added 2026-08-12 — review the grants, not just the role names.** The second query above reports which roles a member holds. Since `role_permissions` became the runtime source of truth, the role *name* no longer tells you what the role can do: a grant edited directly in the database changes the answer without changing the name. Confirm the grant matrix itself against `docs/security.md` §3.1 as part of the same review:
+
+```sql
+SELECT r.slug AS role, p.slug AS permission
+FROM roles r
+JOIN role_permissions rp ON rp.role_id = r.id
+JOIN permissions p ON p.id = rp.permission_id
+WHERE r.tenant_id IS NULL
+ORDER BY r.slug, p.slug;
+```
+
+A row here that §3.1 does not list is either an unrecorded decision or an unauthorised edit, and it is currently in force.
+
 **No session-reaper job exists.** Expired and revoked rows stay in `sessions` until something removes them. Authentication is unaffected — expiry, revocation and the epoch are all checked on every lookup — but the table grows without bound. Cleanup is a manual task today, and `sessions_absolute_expires_at_idx` exists so that it is cheap when it happens:
 
 ```sql
@@ -283,7 +310,7 @@ DELETE FROM sessions WHERE absolute_expires_at < now() OR revoked_at IS NOT NULL
 
 **No audit-log retention job exists either**, and that one is deliberate for now: `audit_logs` is evidence (§2.8), and deleting it on a schedule before a retention window has been agreed would be worse than letting it grow. Track its size in the weekly disk review; the future options (partitioning or an archival sweep) are recorded in `docs/observability.md` §11.
 
-**Migration check:** the Phase 2 line above still applies, and `alembic upgrade head` now covers `0002_identity_access` in addition to `0001_initial_infra`.
+**Migration check:** the Phase 2 line above still applies, and `alembic upgrade head` now covers `0002_identity_access` in addition to `0001_initial_infra`. No migration was added by the 2026-08-12 RBAC correction, so `alembic heads` is unchanged.
 
 ---
 
@@ -298,6 +325,8 @@ DELETE FROM sessions WHERE absolute_expires_at < now() OR revoked_at IS NOT NULL
 **Every incident answers:** was any data lost? was any customer message dropped or duplicated? was any tenant boundary crossed? did an alert fire, and was it actionable?
 
 **Phase 3 addition — two more questions for any incident touching identity:** was any credential material exposed (in a log, a response body, an exception, a trace or a backup), and was any session or key used by someone other than its owner? A credential-exposure incident is SEV1 regardless of how few accounts are involved, and its mitigation always begins with §2.12 and §2.13 before diagnosis, per the "mitigate before diagnosing" rule above.
+
+**Added 2026-08-12 — a third question for any incident involving unexpected access:** did the grant matrix change? `role_permissions` is now authoritative, so an unexplained authorisation outcome can originate in the data rather than in the code. The access-review query in §3 is the fastest way to answer it. Note that no code path currently writes `role_permissions`, so any difference from `docs/security.md` §3.1 was made by hand and is not audit-logged.
 
 ---
 
@@ -319,3 +348,4 @@ DELETE FROM sessions WHERE absolute_expires_at < now() OR revoked_at IS NOT NULL
 - [ ] No live API key unused for > 90 days (§2.13)
 - [ ] `sessions` row count within expectation — no reaper job exists (§3)
 - [ ] `audit_logs` growth reviewed — no retention job exists (§3)
+- [ ] System-role grants still match `docs/security.md` §3.1 — they are runtime-authoritative and nothing audit-logs a manual edit (§3)
