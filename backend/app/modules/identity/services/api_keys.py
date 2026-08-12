@@ -62,12 +62,12 @@ def resolve_scopes(principal: Principal, requested: Sequence[str]) -> list[str]:
     held = {permission.value for permission in principal.permissions}
     escalated = sorted({scope for scope in requested if scope not in held})
     if escalated:
+        refused = ", ".join(escalated)
         raise PermissionDeniedError(
             "An API key cannot be granted more access than you have.",
             details={"required_permission": escalated[0]},
             internal_message=(
-                f"api key scope escalation refused for tenant {principal.tenant_id}: "
-                f"{', '.join(escalated)}"
+                f"api key scope escalation refused for tenant {principal.tenant_id}: {refused}"
             ),
         )
     return sorted(set(requested))
