@@ -319,7 +319,8 @@ What the rule is really protecting is rule 2 of §6: `models` and `repositories`
 | Vectors | pgvector on primary | Replica → separate PG → dedicated vector DB | Retrieval p95 SLO breach or OLTP degradation |
 | Search | SQL filters + full-text | Hybrid (BM25 + vector) rerank | Measured retrieval quality gap |
 | Tenant isolation | Application-scoped repositories — **implemented in Phase 3** as `TenantScopedRepository`, so scoping is structural rather than a filter each call site must remember | + PostgreSQL RLS | Schema stable, or compliance requirement |
-| Session storage | PostgreSQL authoritative + Redis read-through cache with an epoch check — **implemented in Phase 3** | Unchanged; the cache TTL is the only tunable | Auth lookup shows up in latency profiling |
+| Session storage | PostgreSQL authoritative, **no cache** — one indexed lookup on `sessions.token_digest` per authenticated request, plus an epoch check against the user row — **implemented in Phase 3** | Unchanged. A read-through cache is deliberately **not** planned: it would reintroduce a staleness window on the revocation path (`security.md` §2.10) | Auth lookup shows up in latency profiling |
+| Role/permission resolution | Role slugs read from PostgreSQL and cached in Redis for ≤ 60 s, then expanded into permissions through the in-process `DEFAULT_ROLE_GRANTS` table — `role_permissions` is seeded and parity-tested but not read at runtime — **implemented in Phase 3** | `role_permissions` becomes the runtime source, making the grant matrix editable data rather than code | Tenant-defined custom roles (P2) |
 | Outbox dispatch | Poller with `SKIP LOCKED` | + `LISTEN/NOTIFY` hint | Dispatch latency budget < 1 s |
 | Tracing | OTel → collector → Sentry | Tempo/Jaeger or managed APM | Trace volume/retention needs |
 | Crawler | Designed only | Isolated egress-restricted workers | Tenants require website ingestion |
@@ -362,7 +363,7 @@ Ordered steps, each gated by a measurable trigger. Do not pre-build them.
 | 9 | Partitioning (messages, events, usage) | Table > ~100 M rows or slow retention deletes |
 | 10 | Extract a service | Independent scaling/reliability/ownership need |
 
-One Phase 3 note for step 2: sessions are server-side but stored in PostgreSQL and cached in Redis, both shared, so API replicas need no sticky sessions. Argon2id is CPU-bound by design and will show up in step 2's CPU trigger sooner than most endpoints — login cost is a deliberate purchase of resistance to offline cracking, and the correct response to that pressure is more API capacity, not cheaper hashing.
+One Phase 3 note for step 2: sessions are server-side but stored in PostgreSQL — shared by every replica, and held in no process-local state — so API replicas need no sticky sessions. Argon2id is CPU-bound by design and will show up in step 2's CPU trigger sooner than most endpoints — login cost is a deliberate purchase of resistance to offline cracking, and the correct response to that pressure is more API capacity, not cheaper hashing.
 
 ---
 
