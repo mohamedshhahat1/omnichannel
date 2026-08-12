@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT
 
-> **Status:** Phases 0–3 implemented — architecture & documentation, application foundation, infrastructure foundation, and identity & access. Phase 4 (Event Backbone) is **NOT STARTED**. Implementation presence is verified against the repository; execution of the quality gates (Pytest, Ruff, MyPy, Alembic, Docker) is **not** — see `CURRENT_STATE.md`.
+> **Status:** Phases 0–3 implemented — architecture & documentation, application foundation, infrastructure foundation, and identity & access. The 2026-08-12 RBAC correction (runtime authorization reads PostgreSQL `role_permissions`) is **merged** into `phase-2-infrastructure`. Phase 4 (Event Backbone) is **NOT STARTED**. Implementation presence is verified against the repository. The quality gates (Pytest, Ruff, MyPy, Alembic, Docker) have now been executed in CI and the operator reports them green as of 2026-08-12 — that is the operator's report, not an observation made by an automated agent, which is forbidden from accessing CI results. See `CURRENT_STATE.md` §3 and §7.
 > **Audience:** Human engineers and future AI coding sessions.
 > **Rule:** This file, together with `CURRENT_STATE.md`, `ENGINEERING.md`, `DECISIONS.md`, `TODO.md` and `docs/`, is the persistent source of truth for this project. Read these before writing any code.
 
@@ -152,3 +152,5 @@ All channels are normalized into **one internal conversation/message model**. Th
 | `docs/observability.md` | OpenTelemetry, metrics, logs, alerting |
 | `docs/integrations.md` | External provider contracts and abstractions |
 | `docs/operations.md` | Runbooks, backup/DR, incident response |
+
+There is no `OMNICHANNEL_PHASES.md` in this repository. The authoritative phase roadmap is the table in `docs/architecture.md` §15, with live status in `CURRENT_STATE.md`.
