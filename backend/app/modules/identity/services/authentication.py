@@ -127,7 +127,12 @@ class AuthenticationService:
             raise self._rejected("no account matches the presented address")
 
         now = utcnow()
-        if not is_expired(user.locked_until, now=now):
+        # `locked_until` is None when the account has never been locked. Unlike
+        # an expiry deadline, where None means "never expires", None here means
+        # "not locked" - so it must not be read through is_expired alone, which
+        # would treat the absent lock as a lock that never lifts. Reject only
+        # while a real lock is still in the future.
+        if user.locked_until is not None and not is_expired(user.locked_until, now=now):
             self._passwords.spend_verification_budget()
             await self._audit_login(
                 outcome=AuditOutcome.FAILURE,
