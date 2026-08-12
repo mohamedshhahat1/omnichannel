@@ -9,10 +9,16 @@ asks for exactly the authority it needs:
 * `PrincipalDep` - a caller acting inside a tenant, from either a session
   cookie or a bearer API key. Everything tenant-scoped depends on this.
 
-CSRF is enforced here rather than in middleware, because it applies to exactly
-one authentication method. Cookies are attached by the browser automatically,
-so a cookie-authenticated state change needs the double-submit check; a bearer
-key is attached only by code that meant to, so it does not.
+Two transport-level rules live here rather than in middleware, because both
+apply to exactly one authentication method:
+
+* **CSRF and origin checks apply to cookie writes only.** A cookie is attached
+  by the browser whether or not the page meant it, so a cookie-authenticated
+  state change needs proof that the page intended it. A bearer key is attached
+  only by code that chose to, and no attacker's page can make a browser attach
+  one.
+* **A request presents one credential, never two.** `docs/security.md` 2.8
+  makes cookie and API-key authentication mutually exclusive per request.
 """
 
 from __future__ import annotations
@@ -24,11 +30,16 @@ from redis.asyncio import Redis
 
 from app.api.dependencies import DatabaseSessionDep, SettingsDep
 from app.core.errors import InternalError
+from app.core.origins import evaluate_origin
+from app.core.rate_limit import FixedWindowRateLimiter
 from app.core.security import PasswordHashingService
+from app.core.settings import Settings
 from app.modules.identity.domain import Principal
 from app.modules.identity.errors import (
+    AmbiguousCredentialsError,
     AuthenticationFailedError,
     CsrfValidationError,
+    OriginRejectedError,
     TenantNotFoundError,
 )
 from app.modules.identity.repositories import MembershipRepository, SessionRepository
@@ -44,6 +55,7 @@ from app.modules.identity.services.sessions import SessionService
 
 _BEARER_PREFIX: Final = "Bearer "
 _SAFE_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS"})
+_LOGIN_RATE_LIMIT_PURPOSE: Final = "login"
 
 
 def provide_password_hashing(request: Request) -> PasswordHashingService:
@@ -88,6 +100,37 @@ EffectivePermissionCacheDep = Annotated[
 ]
 
 
+def provide_login_rate_limiter(
+    request: Request,
+    settings: SettingsDep,
+) -> FixedWindowRateLimiter | None:
+    """Return the per-source login limiter, or None when it is switched off.
+
+    Redis is resolved the same defensive way as the RBAC cache, and for the
+    same reason: the test application starts no infrastructure, and login must
+    keep working from PostgreSQL alone. The limiter itself then reports
+    `degraded` rather than pretending it counted anything, and the per-account
+    lockout - which lives in PostgreSQL - is unaffected either way.
+    """
+    if not settings.auth.login_rate_limit_enabled:
+        return None
+    client = getattr(request.app.state, "redis", None)
+    return FixedWindowRateLimiter(
+        client if isinstance(client, Redis) else None,
+        environment=settings.environment.value,
+        purpose=_LOGIN_RATE_LIMIT_PURPOSE,
+        limit=settings.auth.login_rate_limit_max_attempts,
+        window_seconds=settings.auth.login_rate_limit_window_seconds,
+        fail_open=settings.auth.login_rate_limit_fail_open,
+    )
+
+
+LoginRateLimiterDep = Annotated[
+    FixedWindowRateLimiter | None,
+    Depends(provide_login_rate_limiter),
+]
+
+
 def provide_audit_service(session: DatabaseSessionDep) -> AuditService:
     """Return an audit writer bound to the request's transaction."""
     return AuditService(session)
@@ -120,6 +163,7 @@ def provide_authentication_service(
     api_keys: ApiKeyServiceDep,
     cache: EffectivePermissionCacheDep,
     audit: AuditServiceDep,
+    login_limiter: LoginRateLimiterDep,
 ) -> AuthenticationService:
     """Return the credential-verification service."""
     return AuthenticationService(
@@ -130,6 +174,7 @@ def provide_authentication_service(
         api_keys=api_keys,
         cache=cache,
         audit=audit,
+        login_limiter=login_limiter,
     )
 
 
@@ -154,12 +199,61 @@ def provide_provisioning_service(
 ProvisioningServiceDep = Annotated[ProvisioningService, Depends(provide_provisioning_service)]
 
 
+def _presented_credentials(request: Request, settings: Settings) -> tuple[bool, bool]:
+    """Report which credential kinds this request carries, without reading them.
+
+    Presence only. Nothing here validates or even parses a credential, so the
+    result is safe to branch on before authentication has happened.
+    """
+    cookie = bool(request.cookies.get(settings.auth.session_cookie_name))
+    header = request.headers.get("Authorization", "")
+    bearer = header.startswith(_BEARER_PREFIX) and bool(header[len(_BEARER_PREFIX) :].strip())
+    return cookie, bearer
+
+
+def reject_ambiguous_credentials(request: Request, settings: Settings) -> None:
+    """Refuse a request that presents both a session cookie and a bearer key.
+
+    `docs/security.md` 2.8: the two authentication methods are mutually
+    exclusive per request. Phase 3 preferred the bearer key when both arrived,
+    which is the wrong answer for three reasons:
+
+    * **Identity confusion.** A browser attaches its cookie to every request to
+      this origin. A page that adds an `Authorization` header - or a proxy, or
+      an SDK with a stale key in its environment - silently acts as the key's
+      tenant while the person at the keyboard is signed in as somebody else.
+      The audit trail then records the wrong actor, and the CSRF check that
+      protects the cookie path is skipped entirely.
+    * **CSRF bypass.** Preferring the bearer key means an attacker who can get
+      *any* `Authorization` header onto a cookie-carrying request routes around
+      the double-submit check.
+    * **No safe precedence exists.** Preferring the cookie instead just moves
+      the confusion; the only unambiguous reading of two credentials is that
+      the client did not mean one of them.
+
+    Raised before either credential is inspected, so the refusal reveals
+    nothing about whether either was valid - it is a statement about the shape
+    of the request, not about its secrets.
+    """
+    cookie, bearer = _presented_credentials(request, settings)
+    if cookie and bearer:
+        raise AmbiguousCredentialsError(
+            internal_message="request presented both a session cookie and a bearer credential",
+        )
+
+
 async def provide_session_identity(
     request: Request,
     settings: SettingsDep,
     authentication: AuthenticationServiceDep,
 ) -> SessionIdentity | None:
-    """Resolve the session cookie, if one was presented and is still live."""
+    """Resolve the session cookie, if one was presented and is still live.
+
+    The ambiguity check runs here, at the first point that touches a
+    credential, so every dependent - `require_session`, `provide_principal` and
+    anything added later - inherits it rather than having to remember it.
+    """
+    reject_ambiguous_credentials(request, settings)
     token = request.cookies.get(settings.auth.session_cookie_name)
     if not token:
         return None
@@ -172,15 +266,63 @@ SessionIdentityOptionalDep = Annotated[
 ]
 
 
+def _enforce_origin(request: Request, settings: Settings) -> None:
+    """Check the browser origin of a cookie-authenticated write.
+
+    Layer 3 of the four CSRF layers in `docs/security.md` 2.4. It earns its
+    place next to the double-submit token because the two fail differently: the
+    token is carried in a cookie that any same-site context can read, while
+    `Origin` is written by the browser and cannot be forged by page script. A
+    subdomain takeover or an XSS on a sibling host defeats the first and not
+    the second.
+
+    The allowlist is the CORS origins plus `csrf_trusted_origins`, and the
+    application's own host always passes - so a single-origin deployment needs
+    no configuration to keep working, and an attacker still cannot pass,
+    because a browser will not let their page claim our host as its origin.
+
+    Whether a *missing* `Origin` and `Referer` is fatal comes from
+    `Settings.require_origin_on_cookie_writes`, which is unconditionally true
+    in production. Outside production it is off so that curl and the test suite
+    can drive the API; a non-browser client cannot be a CSRF victim anyway,
+    because there is no ambient cookie for an attacker's page to borrow.
+    """
+    decision = evaluate_origin(
+        origin_header=request.headers.get("Origin"),
+        referer_header=request.headers.get("Referer"),
+        host_header=request.headers.get("Host"),
+        allowed_origins=(
+            *settings.security.cors_origins,
+            *settings.security.csrf_trusted_origins,
+        ),
+        require_present=settings.require_origin_on_cookie_writes,
+        require_https=settings.is_production,
+    )
+    if not decision.allowed:
+        raise OriginRejectedError(
+            internal_message=(
+                f"origin check failed ({decision.reason}) for "
+                f"{request.method} {request.url.path}"
+            ),
+        )
+
+
 def _enforce_csrf(
     request: Request,
     settings: SettingsDep,
     sessions: SessionService,
     identity: SessionIdentity,
 ) -> None:
-    """Require a matching CSRF header on cookie-authenticated writes."""
+    """Require a valid origin and CSRF header on cookie-authenticated writes.
+
+    Origin first: it is a header comparison with no secret in it, so a request
+    from a foreign origin is refused without the token check running at all.
+    Both failures return the same generic message to the caller; only the
+    internal message says which layer refused.
+    """
     if request.method in _SAFE_METHODS:
         return
+    _enforce_origin(request, settings)
     presented = request.headers.get(settings.auth.csrf_header_name)
     if not sessions.verify_csrf(identity.record, presented):
         raise CsrfValidationError(
@@ -213,10 +355,20 @@ async def provide_principal(
 ) -> Principal:
     """Resolve the caller to a tenant-scoped principal.
 
-    A bearer key wins over a cookie when both are present, because sending an
-    explicit `Authorization` header is an unambiguous statement of intent,
-    while the cookie may just be whatever the browser had lying around.
+    Exactly one credential decides the outcome:
+
+    * cookie only - the session's principal, after the CSRF and origin checks;
+    * bearer only - the API key's principal, with no CSRF check because no
+      browser attaches an `Authorization` header on its own;
+    * both - refused by `reject_ambiguous_credentials`, which has already run
+      inside `provide_session_identity`;
+    * neither - unauthenticated.
+
+    The bearer branch is reached only when no session cookie was presented, so
+    there is no precedence rule left to reason about - which is the point.
     """
+    reject_ambiguous_credentials(request, settings)
+
     header = request.headers.get("Authorization", "")
     if header.startswith(_BEARER_PREFIX):
         presented = header[len(_BEARER_PREFIX) :].strip()

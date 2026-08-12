@@ -128,6 +128,18 @@ class MemberInviteRequest(BaseModel):
     role: str = Field(min_length=1, max_length=MAX_SLUG_LENGTH)
 
 
+class InvitationAcceptRequest(BaseModel):
+    """Accept an invitation to one tenant.
+
+    The tenant is named by slug rather than by membership id, and the caller is
+    taken from the session. There is therefore no identifier in this payload
+    that could point at somebody else's membership - the endpoint can only ever
+    act on the caller's own.
+    """
+
+    tenant_slug: str = Field(min_length=MIN_SLUG_LENGTH, max_length=MAX_SLUG_LENGTH)
+
+
 class RoleAssignmentRequest(BaseModel):
     """Grant one role to an existing membership."""
 

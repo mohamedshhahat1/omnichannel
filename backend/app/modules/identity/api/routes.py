@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request, Response, status
+from fastapi import APIRouter, Path, Query, Request, Response, status
 
 from app.api.dependencies import DatabaseSessionDep, SettingsDep
 from app.core.settings import Settings
@@ -25,6 +25,7 @@ from app.modules.identity.api.dependencies import (
     ApiKeyServiceDep,
     AuditServiceDep,
     AuthenticationServiceDep,
+    EffectivePermissionCacheDep,
     PermissionResolverDep,
     PrincipalDep,
     ProvisioningServiceDep,
@@ -37,6 +38,7 @@ from app.modules.identity.api.schemas import (
     ApiKeyListResponse,
     ApiKeySummary,
     IdentityResponse,
+    InvitationAcceptRequest,
     LoginRequest,
     LoginResponse,
     MemberInviteRequest,
@@ -51,6 +53,7 @@ from app.modules.identity.api.schemas import (
     UserSummary,
 )
 from app.modules.identity.domain import (
+    MAX_SLUG_LENGTH,
     AuditOutcome,
     Permission,
     Principal,
@@ -70,11 +73,41 @@ _MAX_PAGE_LIMIT = 100
 
 LimitQuery = Annotated[int, Query(ge=1, le=_MAX_PAGE_LIMIT)]
 OffsetQuery = Annotated[int, Query(ge=0)]
+RoleSlugPath = Annotated[str, Path(min_length=1, max_length=MAX_SLUG_LENGTH)]
 
 
-def _client_ip(request: Request) -> str | None:
-    client = request.client
-    return client.host if client is not None else None
+def _client_ip(request: Request, settings: Settings) -> str | None:
+    """Resolve the address a request came from.
+
+    Used for audit rows and, since the per-source login limiter exists, to
+    decide which bucket an attempt counts against - which makes getting this
+    wrong a security problem rather than a cosmetic one.
+
+    With `server.trusted_proxy_hops` at its default of zero, only the peer
+    address is used and no forwarding header is read at all. That is the safe
+    default: `X-Forwarded-For` is a request header like any other, and trusting
+    it unconditionally would let a caller choose their own rate-limit bucket -
+    and forge the address written to the audit log - by sending one line of
+    text.
+
+    A non-zero value states how many proxies are in front of this process, each
+    of which appends the peer it saw. The client is then the entry that many
+    positions from the right, the last position an external caller cannot
+    influence. A header shorter than the configured hop count means the request
+    did not arrive through the expected path, so the peer address is used
+    instead of guessing.
+    """
+    peer = request.client.host if request.client is not None else None
+    hops = settings.server.trusted_proxy_hops
+    if hops <= 0:
+        return peer
+    forwarded = request.headers.get(settings.server.forwarded_for_header)
+    if not forwarded:
+        return peer
+    chain = [entry.strip() for entry in forwarded.split(",") if entry.strip()]
+    if len(chain) < hops:
+        return peer
+    return chain[-hops]
 
 
 def _set_session_cookies(response: Response, settings: Settings, issued: IssuedSession) -> None:
@@ -192,6 +225,7 @@ def _identity_response(
 async def register(
     payload: RegistrationRequest,
     request: Request,
+    settings: SettingsDep,
     session: DatabaseSessionDep,
     provisioning: ProvisioningServiceDep,
     audit: AuditServiceDep,
@@ -211,7 +245,7 @@ async def register(
             action="identity.register",
             resource_type="user",
             outcome=AuditOutcome.FAILURE,
-            ip_address=_client_ip(request),
+            ip_address=_client_ip(request, settings),
             context={"reason": "email_already_registered", "email": payload.email},
         )
         await session.commit()
@@ -234,7 +268,7 @@ async def register(
         outcome=AuditOutcome.SUCCESS,
         tenant_id=provisioned.tenant.id,
         actor_user_id=user.id,
-        ip_address=_client_ip(request),
+        ip_address=_client_ip(request, settings),
         context={"tenant_slug": provisioned.tenant.slug},
     )
     await session.commit()
@@ -259,7 +293,7 @@ async def login(
         raw_email=payload.email,
         raw_password=payload.password.get_secret_value(),
         tenant_slug=payload.tenant_slug,
-        ip_address=_client_ip(request),
+        ip_address=_client_ip(request, settings),
         user_agent=request.headers.get("User-Agent"),
     )
     await session.commit()
@@ -345,6 +379,7 @@ async def logout_everywhere(
 async def create_tenant(
     payload: TenantCreateRequest,
     request: Request,
+    settings: SettingsDep,
     session: DatabaseSessionDep,
     provisioning: ProvisioningServiceDep,
     audit: AuditServiceDep,
@@ -371,11 +406,55 @@ async def create_tenant(
         outcome=AuditOutcome.SUCCESS,
         tenant_id=provisioned.tenant.id,
         actor_user_id=identity.user.id,
-        ip_address=_client_ip(request),
+        ip_address=_client_ip(request, settings),
         context={"slug": provisioned.tenant.slug},
     )
     await session.commit()
     return _tenant_summary(provisioned.tenant)
+
+
+@router.post(
+    "/invitations/accept",
+    response_model=MembershipSummary,
+    summary="Accept an invitation to a tenant",
+)
+async def accept_invitation(
+    payload: InvitationAcceptRequest,
+    request: Request,
+    settings: SettingsDep,
+    session: DatabaseSessionDep,
+    provisioning: ProvisioningServiceDep,
+    cache: EffectivePermissionCacheDep,
+    audit: AuditServiceDep,
+    identity: SessionIdentityDep,
+) -> MembershipSummary:
+    """Turn the caller's own invitation into an active membership.
+
+    Authenticated as a person, not as a tenant principal - by definition the
+    caller has no principal in this tenant yet, because an invited membership
+    confers none. Authorisation is therefore identity: the service looks up the
+    caller's own membership in the named tenant and can touch no other.
+
+    Unknown slug, inactive tenant and "never invited" all answer 404, so this
+    endpoint cannot be used to discover which workspaces exist.
+    """
+    accepted = await provisioning.accept_invitation(
+        user=identity.user,
+        raw_tenant_slug=payload.tenant_slug,
+        cache=cache,
+    )
+    await audit.record(
+        action="membership.accept",
+        resource_type="membership",
+        resource_id=str(accepted.membership.id),
+        outcome=AuditOutcome.SUCCESS,
+        tenant_id=accepted.tenant.id,
+        actor_user_id=identity.user.id,
+        ip_address=_client_ip(request, settings),
+        context={"tenant_slug": accepted.tenant.slug},
+    )
+    await session.commit()
+    return _membership_summary(accepted.membership, accepted.role_slugs)
 
 
 @router.get(
@@ -446,13 +525,19 @@ async def list_members(
 async def invite_member(
     payload: MemberInviteRequest,
     request: Request,
+    settings: SettingsDep,
     session: DatabaseSessionDep,
     principal: PrincipalDep,
     provisioning: ProvisioningServiceDep,
     resolver: PermissionResolverDep,
     audit: AuditServiceDep,
 ) -> MembershipSummary:
-    """Create a membership, and the account behind it if it is new."""
+    """Create a membership, and the account behind it if it is new.
+
+    The membership starts `invited` and grants nothing until the person accepts
+    it (`POST /invitations/accept`) or a member manager activates it
+    (`POST /members/{id}/activate`).
+    """
     membership = await provisioning.invite_member(
         principal=principal,
         raw_email=payload.email,
@@ -468,8 +553,50 @@ async def invite_member(
         tenant_id=principal.tenant_id,
         actor_user_id=principal.user_id,
         actor_api_key_id=principal.api_key_id,
-        ip_address=_client_ip(request),
+        ip_address=_client_ip(request, settings),
         context={"role": payload.role, "email": payload.email},
+    )
+    await session.commit()
+    return _membership_summary(membership, await resolver.role_slugs_for(membership.id))
+
+
+@router.post(
+    "/members/{membership_id}/activate",
+    response_model=MembershipSummary,
+    summary="Activate an invited membership",
+)
+async def activate_membership(
+    membership_id: uuid.UUID,
+    request: Request,
+    settings: SettingsDep,
+    session: DatabaseSessionDep,
+    principal: PrincipalDep,
+    provisioning: ProvisioningServiceDep,
+    resolver: PermissionResolverDep,
+    audit: AuditServiceDep,
+) -> MembershipSummary:
+    """Activate somebody else's invited membership, as a member manager.
+
+    The administrative counterpart of `POST /invitations/accept`, for the
+    operator onboarding a colleague directly. Requires `members.manage`; a
+    membership belonging to another tenant is not found rather than forbidden.
+    Activating an already-active membership succeeds and changes nothing.
+    """
+    membership = await provisioning.activate_membership(
+        principal=principal,
+        membership_id=membership_id,
+        resolver=resolver,
+    )
+    await audit.record(
+        action="membership.activate",
+        resource_type="membership",
+        resource_id=str(membership.id),
+        outcome=AuditOutcome.SUCCESS,
+        tenant_id=principal.tenant_id,
+        actor_user_id=principal.user_id,
+        actor_api_key_id=principal.api_key_id,
+        ip_address=_client_ip(request, settings),
+        context={"status": membership.status},
     )
     await session.commit()
     return _membership_summary(membership, await resolver.role_slugs_for(membership.id))
@@ -484,6 +611,7 @@ async def assign_role(
     membership_id: uuid.UUID,
     payload: RoleAssignmentRequest,
     request: Request,
+    settings: SettingsDep,
     session: DatabaseSessionDep,
     principal: PrincipalDep,
     provisioning: ProvisioningServiceDep,
@@ -505,8 +633,54 @@ async def assign_role(
         tenant_id=principal.tenant_id,
         actor_user_id=principal.user_id,
         actor_api_key_id=principal.api_key_id,
-        ip_address=_client_ip(request),
+        ip_address=_client_ip(request, settings),
         context={"role": payload.role},
+    )
+    await session.commit()
+    return _membership_summary(membership, await resolver.role_slugs_for(membership.id))
+
+
+@router.delete(
+    "/members/{membership_id}/roles/{role_slug}",
+    response_model=MembershipSummary,
+    summary="Revoke a role from a membership",
+)
+async def remove_role(
+    membership_id: uuid.UUID,
+    role_slug: RoleSlugPath,
+    request: Request,
+    settings: SettingsDep,
+    session: DatabaseSessionDep,
+    principal: PrincipalDep,
+    provisioning: ProvisioningServiceDep,
+    resolver: PermissionResolverDep,
+    audit: AuditServiceDep,
+) -> MembershipSummary:
+    """Revoke one role, and return the membership as it now stands.
+
+    The counterpart of granting. Returns the updated membership rather than 204
+    so an operator can see the remaining roles in the same response - useful
+    precisely when the reason for the call was an incident.
+
+    Refuses to strip the last active owner: a tenant with no owner cannot be
+    administered or billed through the product at all.
+    """
+    membership = await provisioning.remove_role(
+        principal=principal,
+        membership_id=membership_id,
+        role_slug=role_slug,
+        resolver=resolver,
+    )
+    await audit.record(
+        action="membership.remove_role",
+        resource_type="membership",
+        resource_id=str(membership.id),
+        outcome=AuditOutcome.SUCCESS,
+        tenant_id=principal.tenant_id,
+        actor_user_id=principal.user_id,
+        actor_api_key_id=principal.api_key_id,
+        ip_address=_client_ip(request, settings),
+        context={"role": role_slug},
     )
     await session.commit()
     return _membership_summary(membership, await resolver.role_slugs_for(membership.id))
@@ -537,6 +711,7 @@ async def list_api_keys(
 async def create_api_key(
     payload: ApiKeyCreateRequest,
     request: Request,
+    settings: SettingsDep,
     session: DatabaseSessionDep,
     principal: PrincipalDep,
     api_keys: ApiKeyServiceDep,
@@ -557,7 +732,7 @@ async def create_api_key(
         tenant_id=principal.tenant_id,
         actor_user_id=principal.user_id,
         actor_api_key_id=principal.api_key_id,
-        ip_address=_client_ip(request),
+        ip_address=_client_ip(request, settings),
         # The public key_id is recorded so this key can be traced through the
         # audit log later. The secret never touches this row.
         context={"key_id": issued.record.key_id, "scopes": list(issued.record.scopes)},
@@ -578,6 +753,7 @@ async def create_api_key(
 async def revoke_api_key(
     api_key_id: uuid.UUID,
     request: Request,
+    settings: SettingsDep,
     session: DatabaseSessionDep,
     principal: PrincipalDep,
     api_keys: ApiKeyServiceDep,
@@ -593,7 +769,7 @@ async def revoke_api_key(
         tenant_id=principal.tenant_id,
         actor_user_id=principal.user_id,
         actor_api_key_id=principal.api_key_id,
-        ip_address=_client_ip(request),
+        ip_address=_client_ip(request, settings),
         context={"key_id": record.key_id},
     )
     await session.commit()
