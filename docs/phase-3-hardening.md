@@ -115,6 +115,10 @@ takeover or an XSS on a sibling host defeats the first and not the second.
   a single-origin deployment therefore needs no configuration.
 * Refused: `null`, unparsable values, and any other origin. `Referer` is used
   only when `Origin` is absent.
+* The same-host rule compares **host and port**. A different port is a
+  different origin, so a service on 8443 does not inherit the writes of the
+  dashboard on 443. The first version of this code compared only the host and
+  was caught by its own unit test on the first CI run; see §5.
 * Missing entirely: refused when
   `Settings.require_origin_on_cookie_writes` is true, which is
   **unconditionally true in production** and cannot be configured off. Outside
@@ -169,6 +173,12 @@ latency in the registration path, and it is honest about what it is:
 `BreachedPasswordScreen` accepts an arbitrary corpus, so a deployment that
 wants Pwned Passwords can supply one without touching a call site.
 
+The switch is named `auth.breach_screen_enabled` rather than anything
+containing "password", because `tests/unit/test_auth_settings.py` asserts that
+the only `AuthSettings` field names mentioning a password are the two length
+bounds. That rule keeps credential *material* out of configuration; a boolean
+is not material, but the rule is worth more than the nicer name.
+
 ### 2.7 `permissions_for_roles()` and `DEFAULT_ROLE_GRANTS`
 
 Neither is deleted, because migration `0002_identity_and_access` seeds
@@ -192,14 +202,14 @@ a principal's permissions successfully anyway.
 | `server.forwarded_for_header` | `X-Forwarded-For` | Header consulted when hops > 0 |
 | `security.csrf_trusted_origins` | `()` | Extra origins accepted on cookie writes |
 | `security.require_origin_on_cookie_writes` | `false` | Forced to true in production |
-| `auth.breached_password_check_enabled` | `true` | Must be true in production |
+| `auth.breach_screen_enabled` | `true` | Breached-password screening. Must be true in production |
 | `auth.login_rate_limit_enabled` | `true` | Must be true in production |
 | `auth.login_rate_limit_max_attempts` | `20` | Per source, per window |
 | `auth.login_rate_limit_window_seconds` | `300` | Window length |
 | `auth.login_rate_limit_fail_open` | `true` | Behaviour when Redis is unreachable |
 
 Production settings validation additionally rejects `*` in
-`csrf_trusted_origins`, `breached_password_check_enabled=false` and
+`csrf_trusted_origins`, `breach_screen_enabled=false` and
 `login_rate_limit_enabled=false`.
 
 ---
@@ -209,13 +219,13 @@ Production settings validation additionally rejects `*` in
 ### 4.1 `tests/unit/test_identity_hardening.py`
 
 Origin normalisation and the accept/reject matrix (allowlisted, foreign,
-same-origin, port mismatch, `Referer` fallback, `null`, unparsable, missing
-with and without mandatory presence, insecure scheme); the breach screen
-including an explicit assertion that a multi-word passphrase is **not** flagged;
-fixed-window counting, per-bucket independence, window reset, hashed buckets,
-no-backend degradation, and both fail-open and fail-closed Redis outage
-behaviour; credential-ambiguity detection including an empty bearer value and
-an unrelated cookie.
+same-origin, port mismatch, an explicit default port, `Referer` fallback,
+`null`, unparsable, missing with and without mandatory presence, insecure
+scheme); the breach screen including an explicit assertion that a multi-word
+passphrase is **not** flagged; fixed-window counting, per-bucket independence,
+window reset, hashed buckets, no-backend degradation, and both fail-open and
+fail-closed Redis outage behaviour; credential-ambiguity detection including an
+empty bearer value and an unrelated cookie.
 
 ### 4.2 `tests/integration/test_identity_hardening_api.py`
 
@@ -229,6 +239,12 @@ two valid credentials belonging to different tenants; origin accept, reject,
 missing, `Referer` fallback and bearer exemption; and per-source throttling
 across two accounts and two source addresses.
 
+One trap for anyone extending this file: `_sign_in` clears the client's cookies
+and starts a new session, so every CSRF token issued before it becomes stale.
+Sending a stale one produces a 403 `csrf_validation_failed` that is easily
+mistaken for the refusal a test was hoping to observe - which is exactly how
+two of the faults in §5 arose.
+
 ### 4.3 The two structural guards
 
 `test_no_runtime_module_references_the_static_grant_table` parses every module
@@ -236,34 +252,67 @@ under `app/` and fails if anything except `modules/identity/domain.py` names
 `DEFAULT_ROLE_GRANTS` or `permissions_for_roles`.
 `test_permissions_resolve_from_the_database_even_if_the_grant_table_explodes`
 monkeypatches `permissions_for_roles` to raise and asserts that permission
-resolution still succeeds, returning exactly what the repository reported.
+resolution still succeeds, returning exactly what the repository reported for
+the membership it was asked about.
 
 ---
 
-## 5. What was **not** verified
+## 5. Verification: what has run, and what still has not
 
-No quality gate was executed for this pass. The environment available to it had
-no network access and none of the project's tooling or dependencies installed:
-`ruff`, `mypy`, `pytest`, `alembic` and `docker` were all absent, as were
-`fastapi`, `sqlalchemy`, `redis`, `argon2-cffi`, `httpx` and `asyncpg`.
+The implementation commits in this branch were written without a single gate
+being executed - the authoring environment had no network access and none of
+`ruff`, `mypy`, `pytest`, `alembic`, `docker`, `fastapi`, `sqlalchemy`, `redis`,
+`argon2-cffi`, `httpx` or `asyncpg` installed. Nothing here was verified at the
+time it was written, and this section previously said so.
 
-Consequently **none** of the following were run, and no claim is made about
-their outcome:
+The CI trigger was then widened to run on every branch, and the workflow
+executed against commit `88df434f`. **The integration job really ran** - 122
+tests against the PostgreSQL and Redis service containers, not skipped for
+missing `OC_TEST_DATABASE_URL` / `OC_TEST_REDIS_URL`. It found five distinct
+faults:
 
-| Gate | Status | Reason |
+| Gate | Result on `88df434f` | Cause |
 | --- | --- | --- |
-| `ruff check` / `ruff format --check` | not run | ruff not installed |
-| `mypy` | not run | mypy not installed |
-| `pytest` (unit) | not run | pytest and application dependencies not installed |
-| `pytest -m integration` | not run | pytest absent; `OC_TEST_DATABASE_URL` and `OC_TEST_REDIS_URL` unset and no PostgreSQL or Redis reachable |
-| `alembic upgrade head` | not run | alembic not installed, no database |
-| `docker build` / `docker compose config` | not run | Docker not available |
+| `ruff check` | 7 errors | Unused arguments in test doubles |
+| `ruff format --check` | 2 files | An over-long comprehension; redundant parentheses |
+| `pytest -m "not integration"` | 3 failed, 443 passed | One real bug, one field name, one obsolete workflow assertion |
+| `pytest -m "integration"` | 2 failed, 120 passed | Two faulty tests |
+| `mypy`, `docker build`, `docker compose config` | not observed | Output not available to the author of this note |
 
-The integration tests in this branch would **skip**, not pass, in that
-environment - the existing `postgres_engine` and `redis_client` fixtures skip
-when those variables are unset. They must be run in CI, or locally against the
-compose stack, before this branch is considered verified. Until then the
-correct description of the new tests is "written and reviewed", not "passing".
+The five causes, and what was done about each:
+
+1. **A real bug.** `_host_matches` compared hostnames but not ports, so
+   `https://app.example.com:8443` was accepted as same-origin for a request to
+   `app.example.com`. The test was right and the code was wrong; the code was
+   fixed and a second test now pins the explicit-default-port case.
+2. **A field name.** `breached_password_check_enabled` tripped a pre-existing
+   assertion that no `AuthSettings` field name may mention a password. The
+   setting was renamed (§2.6). The assertion was not touched.
+3. **An obsolete workflow assertion.** `test_ci_workflow.py` required the push
+   trigger to name `main` and `phase-2-infrastructure`; the trigger had
+   deliberately been widened to all branches. This is the only assertion in the
+   pass that changed, and it is now stricter than before.
+4. **Lint.** Test doubles took arguments they never read. The Redis stub's are
+   now underscore-prefixed; the fake repository instead *records* the membership
+   id it was asked for, and the test asserts on it.
+5. **Two faulty integration tests.** Both used a CSRF token invalidated by a
+   later `_sign_in`. One failed outright; the other **passed for the wrong
+   reason**, because it accepted `403 or 404` and got the CSRF 403. It now
+   requires 404 specifically. A third test asked an `apikeys.manage` key to mint
+   a `conversations.read` key, which the API correctly refuses - a key may not
+   grant more access than it holds.
+
+No assertion was weakened, no test was deleted, and no expected value was
+changed to match observed behaviour except where the requirement itself had
+moved (item 3). Four of the five were faults in this branch's own code or
+tests; the fifth was a policy change requested deliberately.
+
+**What this section still cannot claim.** The gates have not been observed
+passing. The fixes above are pushed but the resulting CI run has not been read
+by the author of this note, and `mypy`, `docker build` and `docker compose
+config` have not been seen at all. Until someone can point at a green run of
+every job on this branch's head, the correct description remains "fixed in
+response to a real failing run", not "verified".
 
 No migration was added: nothing in this pass changes the schema.
 
@@ -344,10 +393,11 @@ of amendments. Each item below is the exact change required.
 **`CURRENT_STATE.md`** - the membership lifecycle should be described as
 implemented in both directions into `ACTIVE`; the credential-precedence,
 origin, throttling and breach-screening rows should move to implemented, each
-qualified by §5 (written, not yet executed).
+qualified by §5.
 
 **`TODO.md`** - the corresponding Phase 3 items are addressed on this branch;
-they should not be ticked until the gates in §5 have actually run.
+they should not be ticked until a green run of every job on this branch's head
+has been seen (§5).
 
 **`DECISIONS.md` / ADR-0015** - the historical text must stand. The addendum to
 append, and the limit of what the repository proves:
@@ -373,8 +423,10 @@ reasonable fixture shortcut, but the comment should now point at
 
 ## 8. Recommended before Phase 4
 
-1. Run the gates in §5 and record the result. Nothing here is verified until
-   that happens.
+1. Read the CI run for this branch's head and record the result here. §5
+   documents a failing run and the fixes made in response; it does not document
+   a passing one, and `mypy`, `docker build` and `docker compose config` have
+   not been observed at all.
 2. Apply the amendments in §7.
 3. Decide §6.1 explicitly - per-tenant custom roles, or a documented statement
    that role definitions are migration-managed for the foreseeable future.
