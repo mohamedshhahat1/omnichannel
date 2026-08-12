@@ -27,11 +27,21 @@ def test_ci_workflow_file_and_referenced_paths_exist() -> None:
         assert path.is_file(), f"missing referenced path: {path.relative_to(REPO_ROOT)}"
 
 
-def test_ci_triggers_cover_pull_requests_and_tracked_branches() -> None:
+def test_ci_triggers_cover_pull_requests_and_every_branch() -> None:
+    """Pushes to any branch run the gates; the trigger is not an allowlist.
+
+    It used to be one - `main` and `phase-2-infrastructure` - which meant work
+    on a feature branch got no CI at all until it reached one of them. That is
+    backwards: the gates are worth most before a merge, not after it. A
+    wildcard also cannot go stale the way a hand-maintained branch list does.
+    """
     workflow = _workflow()
     assert "pull_request:" in workflow
-    assert "- main" in workflow
-    assert "- phase-2-infrastructure" in workflow
+    assert 'branches:\n      - "**"' in workflow
+    # Neither name may return as an allowlist entry: a list with a wildcard in
+    # it is still a list, and whichever branch is missing gets no gates.
+    assert "- main\n" not in workflow
+    assert "- phase-2-infrastructure\n" not in workflow
 
 
 def test_ci_uses_the_supported_python_version() -> None:
