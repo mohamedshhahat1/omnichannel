@@ -60,6 +60,20 @@ class ServerSettings(SettingsSection):
     # that identifies its own request.
     trust_inbound_request_id: bool = False
 
+    # How many reverse proxies sit between the client and this process.
+    #
+    # 0 - the default - means the peer address is the client address and no
+    # forwarding header is believed at all. Any other value is a statement that
+    # exactly that many hops are under your control and each of them appends to
+    # `forwarded_for_header`; the client address is then read that many entries
+    # from the right, which is the only position an external caller cannot
+    # forge. Set it wrong and you either throttle your own proxy as a single
+    # client (too low) or let a caller pick their own rate-limit bucket by
+    # sending the header themselves (too high). Phase 2 deploys NGINX as the
+    # sole ingress, so 1 is the value for that topology.
+    trusted_proxy_hops: int = Field(default=0, ge=0, le=8)
+    forwarded_for_header: str = "X-Forwarded-For"
+
     # Defence in depth. The authoritative limit belongs at NGINX (Phase 2);
     # this stops an oversized body from being buffered by the application.
     max_request_body_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
@@ -119,6 +133,21 @@ class SecuritySettings(SettingsSection):
     security_headers_enabled: bool = True
     hsts_max_age_seconds: int = Field(default=63_072_000, ge=0)
 
+    # --- Browser origin validation (docs/security.md 2.4, layer 3) ----------
+    # Origins allowed to perform cookie-authenticated writes, in addition to
+    # `cors_origins` and the application's own host. Kept as a separate list
+    # because CORS answers "may this origin read the response?" while this
+    # answers "may this origin change state?" - and the second list is the one
+    # that has to stay short.
+    csrf_trusted_origins: tuple[str, ...] = ()
+
+    # When true, an unsafe cookie-authenticated request must carry an `Origin`
+    # or `Referer` header at all. Production requires it unconditionally - see
+    # `Settings.require_origin_on_cookie_writes` - so this flag exists to let
+    # curl, the test suite and local tooling drive the API without a browser,
+    # never to switch the control off where it protects anyone.
+    require_origin_on_cookie_writes: bool = False
+
 
 class AuthSettings(SettingsSection):
     """Identity, session, CSRF and API-key configuration (Phase 3, ADR-0009).
@@ -139,6 +168,13 @@ class AuthSettings(SettingsSection):
     argon2_salt_bytes: int = Field(default=16, ge=16, le=64)
     password_min_length: int = Field(default=12, ge=12)
     password_max_length: int = Field(default=1_024, ge=64)
+
+    # `docs/security.md` 2.5 requires new passwords to be screened against a
+    # breached-password list. The screen is local (`app.core.breached_passwords`)
+    # and cannot fail, so there is no operational reason to turn it off; the
+    # switch exists for the same reason the Argon2 cost is a setting, and
+    # production refuses to start with it disabled.
+    breached_password_check_enabled: bool = True
 
     # --- Sessions -----------------------------------------------------------
     session_idle_ttl_seconds: int = Field(default=7 * 24 * 60 * 60, ge=60)
@@ -167,8 +203,29 @@ class AuthSettings(SettingsSection):
     api_key_max_ttl_days: int = Field(default=365, ge=1, le=3_650)
 
     # --- Login throttling -----------------------------------------------------
+    # Per account: the counter lives on the user row, so it survives a restart
+    # and a Redis outage.
     max_failed_logins: int = Field(default=10, ge=3)
     lockout_seconds: int = Field(default=15 * 60, ge=60)
+
+    # Per source address: the other half of `docs/security.md` 2.5. It exists
+    # because the per-account counter is attached to the victim, so spreading
+    # one attempt across ten thousand accounts trips nothing. The document
+    # states the requirement but no numbers, so these are chosen conservatively
+    # and are deliberately generous compared with human behaviour: 20 attempts
+    # in five minutes is far more than a person mistyping a password, and far
+    # less than automation needs to be worth running. Both are configurable
+    # because the right number depends on how many real users share an egress
+    # address, which only the operator knows.
+    login_rate_limit_enabled: bool = True
+    login_rate_limit_max_attempts: int = Field(default=20, ge=1)
+    login_rate_limit_window_seconds: int = Field(default=300, ge=10)
+    # What to do when Redis cannot answer. Open by default: the per-account
+    # lockout is unaffected by a Redis outage, so failing open degrades to
+    # exactly the protection that existed before this limiter, while failing
+    # closed turns a cache outage into a total authentication outage. Set false
+    # where an authentication outage is preferable to an unthrottled window.
+    login_rate_limit_fail_open: bool = True
 
     @model_validator(mode="after")
     def _validate_auth_invariants(self) -> Self:
@@ -308,6 +365,20 @@ class Settings(BaseSettings):
         """True when running in the test environment."""
         return self.environment is Environment.TEST
 
+    @property
+    def require_origin_on_cookie_writes(self) -> bool:
+        """Whether an unsafe cookie write must carry an Origin or Referer.
+
+        Production is not negotiable: every cookie-authenticated client there
+        is a browser, and a browser always sends one of the two on an unsafe
+        request. Outside production the section flag decides, so the suite and
+        local tooling can call the API without pretending to be a browser.
+        Reading it here rather than in the caller means there is exactly one
+        place the production rule can be stated - and no configuration key that
+        can switch it off.
+        """
+        return self.is_production or self.security.require_origin_on_cookie_writes
+
     @model_validator(mode="after")
     def _validate_api_prefix(self) -> Self:
         prefix = self.api_prefix
@@ -352,6 +423,9 @@ class Settings(BaseSettings):
         elif "*" in self.security.trusted_hosts:
             problems.append("security.trusted_hosts must not contain '*' in production")
 
+        if "*" in self.security.csrf_trusted_origins:
+            problems.append("security.csrf_trusted_origins must not contain '*'")
+
         if not self.auth.cookie_secure:
             problems.append("auth.cookie_secure must be enabled in production")
 
@@ -366,6 +440,15 @@ class Settings(BaseSettings):
 
         if self.auth.argon2_time_cost < _PRODUCTION_ARGON2_TIME_COST:
             problems.append("auth.argon2_time_cost is below the production floor")
+
+        # Both controls below are required by docs/security.md 2.5. They are
+        # switchable so the suite can run without them; production is where
+        # that switch stops being available.
+        if not self.auth.breached_password_check_enabled:
+            problems.append("auth.breached_password_check_enabled must stay on in production")
+
+        if not self.auth.login_rate_limit_enabled:
+            problems.append("auth.login_rate_limit_enabled must stay on in production")
 
         if problems:
             raise ValueError("; ".join(problems))
