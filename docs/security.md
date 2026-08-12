@@ -1,6 +1,8 @@
 # Security
 
-> Security architecture, authentication design, tenant isolation and threat model. Design phase — nothing implemented yet.
+> Security architecture, authentication design, tenant isolation and threat model.
+>
+> **Implementation status:** §2 (authentication), §3 (authorisation/RBAC), the SQL and Redis rows of §4 (tenant isolation) and the identity subset of §10 (audit logging) are **implemented as of Phase 3**. Each of those sections carries an implementation-status block stating exactly what exists and what does not. Everything else remains design ahead of implementation.
 
 ---
 
@@ -106,6 +108,38 @@ Cookie authentication and API-key authentication are mutually exclusive per requ
 ### 2.9 Future
 TOTP MFA and step-up authentication for sensitive actions · passkeys/WebAuthn · OIDC/SAML SSO and SCIM for enterprise tenants. Because sessions are opaque and server-side, adding an external identity provider changes only how a session is **established**, never how it is **validated**.
 
+### 2.10 Implementation status (Phase 3)
+
+**Implemented as specified.**
+
+| Area | Where |
+|---|---|
+| 256-bit opaque session tokens; only the SHA-256 digest persisted | `app/core/security.py`, `identity/services/sessions.py` |
+| Cookie name and flags driven by `AuthSettings`; `__Host-` prefix, `Secure` and `Path=/` required in production by a settings validator | `app/core/settings.py` |
+| Sliding idle expiry plus a non-extendable absolute expiry; `last_seen_at` refreshed at most once per `session_touch_interval_seconds` | `identity/services/sessions.py` |
+| `session_epoch` on the user; one increment invalidates every outstanding session, checked on every request | `identity/models.py`, `identity/services/authentication.py` |
+| Double-submit CSRF: `X-CSRF-Token` compared in constant time against the stored digest for every unsafe method | `identity/api/dependencies.py` |
+| Argon2id with parameters from settings, transparent rehash detection on successful verification, production cost floor enforced by settings validation | `app/core/security.py` |
+| Generic, indistinguishable failures: unknown address, wrong password and malformed address all return the same 401 | `identity/services/authentication.py` |
+| Per-account lockout after `max_failed_logins`, refusing even the correct password until it lapses | `identity/services/authentication.py` |
+| Tenant context derived server-side from an active membership; never read from a request body | `identity/api/dependencies.py` |
+| API keys: `key_id` indexed for a single lookup, only the secret digest stored, plaintext returned once at creation, mandatory expiry, revocation, tenant scoping | `identity/services/api_keys.py` |
+| Session metadata (IP, user agent, created, last seen) captured on the row | `identity/models.py`, `identity/api/routes.py` |
+| Every authentication event audit-logged with outcome and reason | `identity/services/audit.py` |
+
+**Deviations from the text above — the code does not yet match the design.**
+
+| § | Design says | Implementation does | Status |
+|---|---|---|---|
+| 2.8 | A request presenting both a cookie and an API key is **rejected** | The bearer key wins and the cookie is ignored | Deviation. "Rejected" is the safer rule; the code should move to it. Tracked in `TODO.md` |
+| 2.4 (3) | `Origin`/`Referer` validated against an allowlist | Not implemented; only `SameSite` and the double-submit token are in place | Outstanding |
+| 2.5 | Passwords checked against a breached-password list | Length and surrounding-whitespace policy only | Outstanding |
+| 2.5 | Rate limited per account **and per IP** | Per-account lockout only | Outstanding — needs the shared rate limiter (P1) |
+| 2.2 | Rotation on password change and email change | Those endpoints do not exist yet, so only login issues a fresh session | Deferred with the endpoints |
+| 2.6 | E-mail verification and password reset | `email_tokens` is modelled and migrated; no transport is wired, so neither flow is usable | Deferred to the P1 delivery work |
+| 2.2 | "Your devices" screen | Metadata is captured; no listing endpoint exists | Deferred |
+| 2.9 | MFA, passkeys, SSO | Not started, explicitly P2 | Deferred |
+
 ---
 
 ## 3. Authorisation and RBAC
@@ -126,24 +160,59 @@ Permission check = active session/API key
 
 Roles are data, so custom roles and finer-grained permissions can be added without a schema redesign.
 
+### 3.1 Grant matrix as seeded (Phase 3)
+
+Migration `0002_identity_access` seeds exactly this. `●` = granted.
+
+| Permission | owner | admin | manager | agent | billing_admin | viewer |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|
+| `tenant.read` | ● | ● | ● | ● | ● | ● |
+| `tenant.update` | ● | ● | | | | |
+| `members.invite` | ● | ● | | | | |
+| `members.manage` | ● | ● | | | | |
+| `channels.connect` | ● | ● | | | | |
+| `channels.manage` | ● | ● | | | | |
+| `conversations.read` | ● | ● | ● | ● | | ● |
+| `conversations.reply` | ● | ● | ● | ● | | |
+| `conversations.assign` | ● | ● | ● | ● | | |
+| `ai.configure` | ● | ● | ● | | | |
+| `knowledge.manage` | ● | ● | ● | | | |
+| `catalog.manage` | ● | ● | ● | | | |
+| `billing.manage` | ● | | | | ● | |
+| `apikeys.manage` | ● | ● | | | | |
+| `audit.read` | ● | ● | | | | |
+
+### 3.2 Implementation status (Phase 3)
+
+- Checks live in `identity/services/authorization.py` and are called from services, not routes, so a future Celery task or AI tool uses the identical path.
+- **A member who lacks a permission gets 403. A caller with no membership in the tenant gets 404**, so an identifier cannot be probed for existence. This is deliberate; see ADR-0015.
+- The seeded rows are the operative copy of the grant matrix. An integration test compares them against the Python `DEFAULT_ROLE_GRANTS` table per role, so the database and the code cannot drift silently.
+- Only an owner may grant the owner role.
+- An API key's scopes are intersected against the creator's permissions at issue time, so a key can never carry more authority than the person who minted it. An unknown scope is 422; a real scope the caller does not hold is 403.
+- Unknown role slugs resolve to no permissions rather than raising — the resolver fails closed.
+- A suspended membership keeps its row but resolves to no principal, so access stops without destroying history.
+- **Plan entitlement is not part of the check yet** — the billing module does not exist. The line stays in the model above because entitlement will slot into the same choke point.
+
 ---
 
 ## 4. Tenant isolation controls
 
-| Surface | Control |
-|---|---|
-| SQL | Tenant-scoped repositories inject `tenant_id`; unscoped access to tenant tables is prohibited outside reviewed admin paths |
-| Redis | Key namespace `oc:{env}:t:{tenant_id}:{purpose}:{key}` |
-| Celery | Every payload carries `tenant_id`; the task rebuilds the trusted context before touching data |
-| Object storage | Keys prefixed `tenants/{tenant_id}/...`; signed URLs issued only after an authorisation check |
-| Vector search | `tenant_id` predicate applied before ranking, in the repository — not in caller code |
-| AI tools | Tools receive the tenant context from the runtime, never from model-supplied arguments |
-| Webhooks | Tenant resolved from the verified integration mapping, never from payload fields |
-| Caches | Tenant id is part of every cache key |
-| Audit logs | Tenant-scoped, read gated by `audit.read` |
-| Exports/reports | Scoped and rate limited; large exports run as tenant-scoped jobs |
+| Surface | Control | Status |
+|---|---|---|
+| SQL | Tenant-scoped repositories inject `tenant_id`; unscoped access to tenant tables is prohibited outside reviewed admin paths | **Implemented (Phase 3)** — `TenantScopedRepository`; scoping is structural, so a caller cannot express an unscoped query. Globally-scoped lookups (user by e-mail, session by digest, API key by `key_id`) are separate, explicitly named classes |
+| Redis | Key namespace `oc:{env}:t:{tenant_id}:{purpose}:{key}` | **Implemented (Phase 2, used in Phase 3)** by the RBAC role cache |
+| Celery | Every payload carries `tenant_id`; the task rebuilds the trusted context before touching data | Implemented (Phase 2); no identity tasks exist yet |
+| Object storage | Keys prefixed `tenants/{tenant_id}/...`; signed URLs issued only after an authorisation check | Pending — module not started |
+| Vector search | `tenant_id` predicate applied before ranking, in the repository — not in caller code | Pending — module not started |
+| AI tools | Tools receive the tenant context from the runtime, never from model-supplied arguments | Pending — module not started |
+| Webhooks | Tenant resolved from the verified integration mapping, never from payload fields | Pending — Phase 4+ |
+| Caches | Tenant id is part of every cache key | Implemented for the RBAC cache |
+| Audit logs | Tenant-scoped, read gated by `audit.read` | Partially — rows are tenant-scoped and the permission exists; no read endpoint yet |
+| Exports/reports | Scoped and rate limited; large exports run as tenant-scoped jobs | Pending |
 
 **Testing:** every module with tenant data ships tests asserting that tenant A cannot read, update, delete, retrieve, or reference tenant B — including through AI tools and signed URLs.
+
+Phase 3 covers the SQL surface for identity: a real, active membership in another tenant resolves to `None` by id and by user, never appears in a listing, and cross-tenant revocation of a real API key answers 404. Redis, object storage, retrieval and tools remain to be covered as those modules land.
 
 RLS is planned as an additional layer once the schema stabilises (ADR-0002).
 
@@ -188,6 +257,20 @@ Controls required before any fetch (ADR-0012):
 - Signing keys, database credentials and provider keys have documented rotation procedures (`operations.md`).
 - Secrets are excluded from logs, traces, Sentry payloads and error messages by centralised redaction.
 
+### 7.1 Credential handling in the identity module (Phase 3)
+
+No credential material is ever stored in a recoverable form, and none is returned after creation:
+
+| Credential | Stored as | Returned |
+|---|---|---|
+| Password | Argon2id hash | Never |
+| Session token | SHA-256 digest | Only in the `Set-Cookie` at issue |
+| CSRF token | SHA-256 digest | Only in the `Set-Cookie` at issue |
+| API key secret | SHA-256 digest | Exactly once, in the 201 that created it |
+| E-mail token | SHA-256 digest | Only in the (not yet wired) message |
+
+Supporting controls: response schemas are built field by field rather than from ORM attributes, so adding a column cannot leak it by default; audit context is scrubbed against a marker list (`pass`, `secret`, `token`, `credential`, `authorization`, `cookie`, `digest`, `hash`, `api_key`) before it is written, with values truncated; anything sensitive in an error goes in `internal_message`, which ADR-0013 guarantees is logged and never serialised. An integration test asserts a failed login's audit context does not contain the attempted password, and an API test asserts no response body ever contains a stored digest.
+
 ---
 
 ## 8. Transport, headers and network
@@ -208,6 +291,16 @@ Recorded: authentication events, session revocations, API key lifecycle, members
 
 Each entry: tenant, actor type and id, action, resource type and id, metadata, IP, `correlation_id`, timestamp. Audit logs are append-only, retained at least 12 months, and readable only with `audit.read`.
 
+### 10.1 Implementation status (Phase 3)
+
+The `audit_logs` table exists with tenant, actor, action, outcome, resource, context, IP, correlation id and timestamp, indexed for the three queries that matter (by tenant over time, by actor over time, by action over time). Actions emitted today:
+
+`auth.login` · `auth.logout` · `auth.logout_all` · `identity.register` · `tenant.create` · `membership.invite` · `membership.assign_role` · `apikey.create` · `apikey.revoke`
+
+Each carries an outcome, and failures carry a reason (`locked_out`, `bad_credentials`, `inactive_account`). Correlation and request ids are pulled from the ambient context by the audit service itself, so no call site can forget them.
+
+Not yet implemented: append-only enforcement at the database level (the table is append-only by convention, not by permission or trigger), the 12-month retention policy, and a read endpoint gated by `audit.read`. The remaining action list belongs to modules that do not exist yet.
+
 ---
 
 ## 11. Threat model (STRIDE, abbreviated)
@@ -225,10 +318,12 @@ Each entry: tenant, actor type and id, action, resource type and id, metadata, I
 | | Leak via AI context | Tenant-scoped retrieval, output validation |
 | | Secrets in logs | Centralised redaction, secret scanning |
 | | Public object URLs | Private buckets, short-lived signed URLs |
+| | **Account enumeration** | Identical responses for unknown vs. registered address on login and registration; 404 rather than 403 for cross-tenant objects |
 | **Denial of service** | Webhook flood | Edge + application rate limits, thin endpoints, async processing |
 | | AI cost exhaustion | Entitlements, per-tenant quotas, cost alerts |
 | | Crawler resource abuse | Hard limits and container quotas |
 | **Elevation of privilege** | Missing authorisation check | Service-layer enforcement, per-permission tests |
+| | **API key minted with more scope than its creator** | Scopes intersected against the creator's permissions at issue time |
 | | Prompt injection → tool abuse | Tools authorise independently of the model |
 | | SSRF → internal access | IP/DNS/redirect validation, IP pinning, egress restriction |
 
@@ -242,15 +337,17 @@ Pinned dependencies with lock files · vulnerability scanning in CI with a docum
 
 ## 13. Launch security checklist
 
-- [ ] Cross-tenant isolation tests passing across DB, Redis, storage, retrieval and tools
-- [ ] All webhooks signature-verified with replay protection
-- [ ] Argon2id parameters tuned and benchmarked
-- [ ] Session rotation, revocation and epoch invalidation verified
-- [ ] CSRF and CORS verified with a hostile-origin test
-- [ ] Rate limits on auth, webhooks, AI and uploads
-- [ ] Secret scanning and dependency scanning green
-- [ ] Log redaction verified for tokens, keys and PII (including Sentry)
-- [ ] TLS, HSTS and security headers verified
-- [ ] Audit logging covers the launch-critical action list
-- [ ] Prompt-injection fixtures passing
-- [ ] Restore rehearsal completed within the RTO target
+No box below is ticked. Phase 3 was authored in an environment with no network and no installed dependencies, so `pytest`, `ruff`, `mypy` and Docker could not be executed there; CI is the first authoritative run. Items are annotated with what exists today.
+
+- [ ] Cross-tenant isolation tests passing across DB, Redis, storage, retrieval and tools — *DB surface written for identity in Phase 3 (negative cross-tenant cases by id, by user, in listings, and on revocation); Redis, storage, retrieval and tools pending those modules*
+- [ ] All webhooks signature-verified with replay protection — *Phase 4+*
+- [ ] Argon2id parameters tuned and benchmarked — *parameters are configurable with a production floor enforced by settings validation; not yet benchmarked on production hardware*
+- [ ] Session rotation, revocation and epoch invalidation verified — *implemented and covered by written tests; awaiting a green CI run*
+- [ ] CSRF and CORS verified with a hostile-origin test — *double-submit implemented and tested; `Origin`/`Referer` validation not implemented*
+- [ ] Rate limits on auth, webhooks, AI and uploads — *per-account lockout only; no shared rate limiter yet*
+- [ ] Secret scanning and dependency scanning green — *not yet added to CI*
+- [ ] Log redaction verified for tokens, keys and PII (including Sentry) — *Phase 1 redaction plus Phase 3 audit-context scrubbing; not yet verified end to end*
+- [ ] TLS, HSTS and security headers verified — *headers implemented in Phase 1; no TLS terminator deployed*
+- [ ] Audit logging covers the launch-critical action list — *identity actions covered; the rest belong to later modules*
+- [ ] Prompt-injection fixtures passing — *AI module not started*
+- [ ] Restore rehearsal completed within the RTO target — *not attempted*
