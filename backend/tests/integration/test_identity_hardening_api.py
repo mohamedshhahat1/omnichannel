@@ -14,6 +14,12 @@ are configuration-dependent:
 * `throttled_app` injects an in-memory limiter through the dependency
   override, so per-source throttling is tested without requiring Redis. The
   Redis-backed implementation is covered in `tests/unit/test_identity_hardening.py`.
+
+One trap worth knowing before editing anything here: `_sign_in` clears the
+client's cookies and starts a *new* session, so any CSRF token captured before
+it is dead afterwards. Using a stale one produces a 403
+`csrf_validation_failed` that looks convincingly like whatever refusal the test
+was hoping to see.
 """
 
 import uuid
@@ -178,7 +184,13 @@ async def _sign_in(
     tenant_slug: str | None = None,
     password: str = PASSWORD,
 ) -> str:
-    """Drop whatever cookies are held and sign in. Returns the CSRF token."""
+    """Drop whatever cookies are held and sign in. Returns the CSRF token.
+
+    The returned token belongs to the session this call created. Every token
+    handed out earlier is now stale, and sending one produces a 403 that has
+    nothing to do with whatever the test is trying to prove - so always bind
+    the result rather than discarding it.
+    """
     client.cookies.clear()
     body: dict[str, Any] = {"email": email, "password": password}
     if tenant_slug is not None:
@@ -286,19 +298,28 @@ async def test_accepting_the_same_invitation_twice_is_harmless(client: AsyncClie
 async def test_accepting_an_invitation_that_was_never_issued_is_not_found(
     client: AsyncClient,
 ) -> None:
-    """404 rather than 403: the endpoint must not confirm that a tenant exists."""
-    stranger, stranger_csrf = await _register_and_login(client)
+    """404 rather than 403: the endpoint must not confirm that a tenant exists.
+
+    The token must come from the *final* sign-in. An earlier one would fail CSRF
+    validation and return 403, and this test would then be asserting that the
+    stranger was stopped - true, but by the wrong control, and it would keep
+    passing even if tenant isolation were removed entirely.
+    """
+    stranger, _ = await _register_and_login(client)
     other, _ = await _register_and_login(client)
 
-    await _sign_in(client, email=stranger["email"], tenant_slug=stranger["tenant_slug"])
+    stranger_csrf = await _sign_in(
+        client,
+        email=stranger["email"],
+        tenant_slug=stranger["tenant_slug"],
+    )
     response = await client.post(
         f"{API_PREFIX}/invitations/accept",
         json={"tenant_slug": other["tenant_slug"]},
         headers={"X-CSRF-Token": stranger_csrf},
     )
-    assert response.status_code in {403, 404}
-    if response.status_code == 404:
-        assert "not_found" in response.text
+    assert response.status_code == 404, response.text
+    assert "not_found" in response.text
 
 
 async def test_a_member_manager_can_activate_an_invited_membership(client: AsyncClient) -> None:
@@ -350,18 +371,23 @@ async def test_activating_a_membership_without_members_manage_is_refused(
 
 
 async def test_a_membership_in_another_tenant_cannot_be_activated(client: AsyncClient) -> None:
-    """Tenant isolation: 404, so the identifier is not confirmed to exist."""
+    """Tenant isolation: 404, so the identifier is not confirmed to exist.
+
+    `_register_and_login` leaves the client signed in as the second owner with a
+    matching CSRF token, so there is nothing to re-sign-in for. An extra
+    `_sign_in` here would invalidate the token this test then sends and turn the
+    result into a 403 that proves nothing about tenant isolation.
+    """
     _, first_csrf = await _register_and_login(client)
     _, foreign_membership = await _invite(client, first_csrf)
 
-    second, second_csrf = await _register_and_login(client)
-    await _sign_in(client, email=second["email"], tenant_slug=second["tenant_slug"])
+    _, second_csrf = await _register_and_login(client)
 
     response = await client.post(
         f"{API_PREFIX}/members/{foreign_membership}/activate",
         headers={"X-CSRF-Token": second_csrf},
     )
-    assert response.status_code == 404
+    assert response.status_code == 404, response.text
     assert "membership_not_found" in response.text
 
 
@@ -666,6 +692,12 @@ async def test_a_bearer_client_is_not_subject_to_the_origin_rule(
 
     There is no ambient credential for an attacker's page to borrow: the key is
     attached only by code that chose to attach it.
+
+    The requested scope matches the acting key's own scope on purpose. A key may
+    not mint a key with more access than it holds, so asking for anything wider
+    here would be refused for a reason that has nothing to do with origins - and
+    the test would look like a failure of this rule rather than a demonstration
+    of a different one.
     """
     _, csrf_token = await _register_and_login(origin_client)
     secret = await _create_key_with_origin(origin_client, csrf_token)
@@ -673,7 +705,7 @@ async def test_a_bearer_client_is_not_subject_to_the_origin_rule(
     origin_client.cookies.clear()
     response = await origin_client.post(
         f"{API_PREFIX}/api-keys",
-        json={"name": "from-ci", "scopes": ["conversations.read"]},
+        json={"name": "from-ci", "scopes": ["apikeys.manage"]},
         headers={"Authorization": f"Bearer {secret}"},
     )
     assert response.status_code == 201, response.text
