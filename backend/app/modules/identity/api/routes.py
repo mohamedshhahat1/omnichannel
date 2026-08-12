@@ -301,6 +301,7 @@ async def read_current_identity(
 @router.post(
     "/auth/logout",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
     summary="Revoke the current session",
 )
 async def logout(
@@ -319,6 +320,7 @@ async def logout(
 @router.post(
     "/auth/logout-all",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
     summary="Revoke every session for the current user",
 )
 async def logout_everywhere(
@@ -570,6 +572,7 @@ async def create_api_key(
 @router.delete(
     "/api-keys/{api_key_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
     summary="Revoke an API key",
 )
 async def revoke_api_key(
