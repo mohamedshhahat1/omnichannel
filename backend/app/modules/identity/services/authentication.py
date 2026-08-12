@@ -26,6 +26,8 @@ from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import RateLimitedError
+from app.core.rate_limit import RateLimiter
 from app.core.security import PasswordHashingService
 from app.core.settings import AuthSettings
 from app.modules.identity import models
@@ -92,6 +94,7 @@ class AuthenticationService:
         api_keys: ApiKeyService,
         cache: EffectivePermissionCache,
         audit: AuditService,
+        login_limiter: RateLimiter | None = None,
     ) -> None:
         self._session = session
         self._settings = settings
@@ -100,6 +103,10 @@ class AuthenticationService:
         self._api_keys = api_keys
         self._cache = cache
         self._audit = audit
+        # Optional so that a caller with no Redis - the test application, a
+        # future CLI - still gets a working service with the per-account
+        # lockout intact, rather than a hard dependency on a cache.
+        self._login_limiter = login_limiter
         self._users = UserRepository(session)
         self._tenants = TenantRepository(session)
 
@@ -113,6 +120,8 @@ class AuthenticationService:
         user_agent: str | None = None,
     ) -> LoginResult:
         """Verify a password and issue a session, or fail indistinguishably."""
+        await self._enforce_source_rate_limit(ip_address)
+
         try:
             email = normalize_email(raw_email)
         except ValueError:
@@ -191,6 +200,47 @@ class AuthenticationService:
             ip_address=ip_address,
         )
         return LoginResult(user=user, issued=issued)
+
+    async def _enforce_source_rate_limit(self, ip_address: str | None) -> None:
+        """Throttle login attempts by source address (`docs/security.md` 2.5).
+
+        Three properties are deliberate:
+
+        * **It counts before anything else happens.** The attempt is refused
+          before the address is looked up and before Argon2 runs, so a flood
+          costs the attacker a request and costs us one Redis `INCR`.
+        * **It counts every attempt, whatever account it names and whether or
+          not it succeeds.** A per-account counter is stepped around by
+          changing the account - which is precisely what credential stuffing
+          does - so the per-source counter must not be resettable by trying a
+          different victim, or by occasionally guessing right.
+        * **It complements, never replaces, the lockout.** When the limiter is
+          absent or Redis is unreachable, `users.failed_logins` and
+          `locked_until` are untouched and still stop a focused attack on one
+          account.
+
+        A request with no resolvable source address is not throttled, because
+        the alternative - bucketing every such request together - would let one
+        client with a hidden address lock out all of them. `_client_ip` in the
+        routes is the only thing that produces this value, and it never trusts
+        a forwarding header unless the deployment says how many hops to trust.
+        """
+        if self._login_limiter is None or ip_address is None:
+            return
+        decision = await self._login_limiter.hit(ip_address)
+        if decision.allowed:
+            return
+        await self._audit_login(
+            outcome=AuditOutcome.FAILURE,
+            ip_address=ip_address,
+            reason="source_rate_limited",
+        )
+        raise RateLimitedError(
+            details={"retry_after_seconds": decision.retry_after_seconds},
+            internal_message=(
+                "login attempts from this source address exceeded the configured window"
+            ),
+        )
 
     async def identify_session(self, token: str) -> SessionIdentity | None:
         """Resolve a presented session token to its identity, or None."""
@@ -305,6 +355,11 @@ class AuthenticationService:
         An unusable slug produces a tenantless session rather than an error.
         Distinguishing "no such workspace" from "not your workspace" would turn
         the login form into a lookup service for customer names.
+
+        An `INVITED` membership is not usable here, which is what makes
+        acceptance meaningful: until the invitation is accepted or activated,
+        signing in with that workspace's slug produces a tenantless session
+        rather than a privileged one.
         """
         if tenant_slug is None:
             return None

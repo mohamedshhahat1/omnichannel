@@ -28,7 +28,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import Select, or_, select, update
+from sqlalchemy import Select, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.identity import models
@@ -105,9 +105,12 @@ class UserRepository:
     ) -> None:
         """Count a failure and lock the account once the threshold is hit.
 
-        Throttling is per account rather than per IP because an attacker
-        controls their source address and does not control which account they
-        are trying to break into.
+        This counter is attached to the account under attack, so it is the
+        control that survives an attacker changing source address. The
+        complementary per-source limiter lives in `app.core.rate_limit` and is
+        applied by `AuthenticationService`: neither replaces the other, because
+        one is stepped around by rotating addresses and the other by rotating
+        accounts.
         """
         user.failed_logins += 1
         if user.failed_logins >= max_failures:
@@ -317,6 +320,30 @@ class MembershipRepository(TenantScopedRepository):
             models.MembershipRole(membership_id=membership_id, role_id=role_id),
         )
         await self._session.flush()
+
+    async def remove_role(self, *, membership_id: uuid.UUID, role_id: uuid.UUID) -> bool:
+        """Detach a role from a membership. False when it was not held.
+
+        The `IN` subquery is what keeps this tenant scoped. A `DELETE` cannot be
+        built from `_base()`, so the predicate is restated explicitly rather
+        than trusted to the caller: an id belonging to another tenant matches no
+        row and reports the same "not held" as an id that simply has no such
+        assignment. Returning a boolean rather than raising leaves the choice of
+        error - and therefore of what the caller is allowed to learn - with the
+        service.
+        """
+        scoped_membership_ids = select(models.Membership.id).where(
+            models.Membership.id == membership_id,
+            models.Membership.tenant_id == self.tenant_id,
+            models.Membership.deleted_at.is_(None),
+        )
+        stmt = delete(models.MembershipRole).where(
+            models.MembershipRole.membership_id.in_(scoped_membership_ids),
+            models.MembershipRole.role_id == role_id,
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return bool(result.rowcount)
 
     async def set_status(self, membership: models.Membership, status: MembershipStatus) -> None:
         """Change a membership's status."""
